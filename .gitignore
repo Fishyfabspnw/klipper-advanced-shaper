@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+build/
+dist/
+.venv/
+venv/
+
+# Calibration data and generated reports are private by default.
+captures/
+results/
+reports/
+*.stdata
+*.csv
+
+# Never commit local credentials or machine-specific configuration.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+known_hosts
+ssh_config
+printer.cfg
+secrets/

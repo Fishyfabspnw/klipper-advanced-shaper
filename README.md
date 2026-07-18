@@ -1,0 +1,113 @@
+# Klipper Advanced Shaper
+
+Klipper Advanced Shaper is an experimental, fail-closed calibration and analysis
+plugin for [Klipper](https://www.klipper3d.org/). It aims to find better measured
+trade-offs between residual vibration, smoothing, repeatability, and usable
+acceleration while continuing to use Klipper's native input-shaper execution.
+It does **not** replace or modify Klipper's motion planner, kinematics, or MCU
+code.
+
+> **Alpha safety notice:** `0.1.0a1` has not been validated across printer
+> architectures and must not be treated as proof that a printer can safely run
+> at a reported acceleration. Keep clear of moving machinery, supervise tests,
+> and use conservative mechanical limits.
+
+## Design goals
+
+- Compare candidates using held-out accelerometer captures, not only fitted data.
+- Abstain when capture quality or statistical confidence is inadequate.
+- Restore native shaper and velocity state after every calibration path.
+- Require an explicit command before applying or staging a result.
+- Keep raw accelerometer data private unless its owner deliberately publishes it.
+
+The project makes no blanket claim to be “100% better” than Klipper. A result is
+better only when a matched, repeatable benchmark demonstrates both a higher
+smoothing-derived acceleration estimate and lower held-out residual vibration.
+See [the benchmark protocol](docs/benchmarking.md).
+
+## Install
+
+On the Klipper host, clone this repository somewhere outside the Klipper source
+tree, then run:
+
+```sh
+chmod +x scripts/install.sh scripts/update.sh
+./scripts/install.sh
+```
+
+The installer supports `KLIPPER_DIR` and `KLIPPER_VENV` when Klipper is not in
+the usual `~/klipper` and `~/klippy-env` locations. It installs the Python
+package into Klipper's virtual environment and a small loader into
+`klippy/extras`. A differing existing loader is preserved with a `.previous`
+suffix. The installer does not restart Klipper or edit printer configuration.
+
+Add this section to `printer.cfg`, review it, and restart Klipper while idle:
+
+```ini
+[advanced_input_shaper]
+# result_folder: ~/printer_data/config/AdvancedShaper_results
+# keep_raw_data: True
+# minimum_max_accel_x: 16150  # Optional target-printer acceptance gate
+# minimum_max_accel_y: 5840   # Optional target-printer acceptance gate
+```
+
+To update an unmodified checkout with a fast-forward-only pull:
+
+```sh
+./scripts/update.sh
+```
+
+## Commands
+
+```text
+ADV_SHAPER_CALIBRATE AXIS=X|Y|ALL PROFILE=quality|balanced|performance REPEATS=3 VALIDATE=1
+ADV_SHAPER_STATUS
+ADV_SHAPER_CANCEL
+ADV_SHAPER_APPLY RESULT=<id>
+ADV_SHAPER_STAGE RESULT=<id>
+```
+
+`APPLY` is runtime-only. `STAGE` prepares accepted native input-shaper values;
+the operator must separately invoke Klipper's `SAVE_CONFIG`. Calibration never
+automatically changes heater, fan, motor-current, or persistent acceleration
+settings.
+
+With `VALIDATE=1`, each axis uses three fitting sweeps, three independent
+held-out sweeps using the shaper active at session start, and three sweeps using
+the proposed shaper. To compare directly against a Shake&Tune result, apply that
+reference result for the runtime before starting the session. The
+candidate is accepted only when the 95% confidence interval demonstrates at
+least 10% resonant-band attenuation. Every temporary setting is restored before
+the result becomes reviewable.
+
+## Development
+
+Python 3.9–3.11 is supported. Create a virtual environment, then run:
+
+```sh
+python -m pip install -e '.[test]'
+python -m pytest
+python -m build
+python scripts/verify_public_tree.py
+```
+
+The numerical tests use generated signals only. Do not add real printer
+captures, generated reports, printer configuration, login material, or local
+automation state to this repository.
+
+## References and relationship to other projects
+
+The implementation is informed by Klipper's public documentation and source:
+
+- [Measuring resonances](https://www.klipper3d.org/Measuring_Resonances.html)
+- [Resonance compensation](https://www.klipper3d.org/Resonance_Compensation.html)
+- [Klipper shaper calibration source](https://github.com/Klipper3d/klipper/blob/master/klippy/extras/shaper_calibrate.py)
+- [Shake&Tune](https://github.com/Frix-x/klippain-shaketune)
+
+This is an independent implementation, not a Shake&Tune fork. No Shake&Tune or
+Klipper source is currently vendored. Any future adapted code must retain its
+license notices and be recorded in `docs/third-party.md`.
+
+## License
+
+Copyright © 2026 Fishyfabspnw. Licensed under GPL-3.0-only. See [LICENSE](LICENSE).
