@@ -18,6 +18,11 @@ from .state import CalibrationCancelled, CalibrationState, StateMachine
 SUPPORTED_PROFILES = {"quality", "balanced", "performance"}
 
 
+def _analysis_unavailable(**_: Any) -> Mapping[str, Any]:
+    """Spawn-picklable fallback used when the analysis package cannot load."""
+    raise RuntimeError("analysis engine is unavailable")
+
+
 @dataclass(frozen=True)
 class CalibrationResult:
     result_id: str
@@ -84,15 +89,12 @@ class AdvancedInputShaper:
 
     @staticmethod
     def _load_default_analyzer() -> Callable[..., Mapping[str, Any]]:
-        def unavailable(**_: Any) -> Mapping[str, Any]:
-            raise RuntimeError("analysis engine is unavailable")
-
         try:
             from klipper_advanced_shaper.analysis import analyze_calibration
 
             return analyze_calibration
         except (ImportError, AttributeError):
-            return unavailable
+            return _analysis_unavailable
 
     def _register_commands(self, gcode: Any) -> None:
         commands = {

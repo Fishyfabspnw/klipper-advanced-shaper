@@ -59,8 +59,11 @@ class SupervisedWorker:
         arguments: Mapping[str, Any],
         checkpoint: Callable[[], None],
     ) -> Any:
-        methods = multiprocessing.get_all_start_methods()
-        context = multiprocessing.get_context("fork" if "fork" in methods else "spawn")
+        # Klippy is multithreaded and imports NumPy/OpenBLAS before calibration.
+        # Forking that process can inherit a numerical-library lock whose owner
+        # thread no longer exists in the child.  Always start a clean interpreter
+        # so analysis cannot hang on inherited thread or allocator state.
+        context = multiprocessing.get_context("spawn")
         # A Queue owns a feeder thread.  A child returning a sufficiently large
         # value can block during interpreter shutdown until the parent drains
         # that feeder, while the old parent loop waited for child shutdown
@@ -72,7 +75,12 @@ class SupervisedWorker:
             args=(child_output, function, arguments, self.memory_mb, self.cpu_seconds),
             daemon=True,
         )
-        process.start()
+        try:
+            process.start()
+        except BaseException:
+            output.close()
+            child_output.close()
+            raise
         child_output.close()
         started = self.reactor.monotonic()
         result: Any = None
