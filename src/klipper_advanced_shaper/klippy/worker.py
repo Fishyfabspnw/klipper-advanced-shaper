@@ -1,42 +1,41 @@
-"""Supervised low-priority process runner for analysis and artifact work."""
+"""Supervised external-interpreter runner for analysis and artifact work."""
 
 from __future__ import annotations
 
-import multiprocessing
 import os
-import traceback
-from typing import Any, Callable, Mapping
+import pickle
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional
 
 
-def _entry(
-    output: Any,
-    function: Callable[..., Any],
-    arguments: Mapping[str, Any],
-    memory_mb: int,
-    cpu_seconds: int,
-) -> None:
+def _private_pickle(path: Path, value: Any) -> None:
+    descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        if hasattr(os, "nice"):
-            os.nice(10)
-        try:
-            import resource
-
-            if memory_mb:
-                limit = memory_mb * 1024 * 1024
-                resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-            if cpu_seconds:
-                resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
-        except (ImportError, OSError, ValueError):
-            pass
-        output.send((True, function(**dict(arguments))))
+        with os.fdopen(descriptor, "wb") as stream:
+            pickle.dump(value, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
     except BaseException:
         try:
-            output.send((False, traceback.format_exc()))
-        except (BrokenPipeError, EOFError, OSError):
-            # The parent may have cancelled or timed out while work was running.
+            os.close(descriptor)
+        except OSError:
             pass
-    finally:
-        output.close()
+        raise
+
+
+def _stop_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2.0)
 
 
 class SupervisedWorker:
@@ -47,11 +46,13 @@ class SupervisedWorker:
         timeout: float = 600.0,
         memory_mb: int = 1536,
         cpu_seconds: int = 300,
+        temporary_root: Optional[str] = None,
     ) -> None:
         self.reactor = reactor
         self.timeout = float(timeout)
         self.memory_mb = int(memory_mb)
         self.cpu_seconds = int(cpu_seconds)
+        self.temporary_root = temporary_root
 
     def run(
         self,
@@ -59,69 +60,75 @@ class SupervisedWorker:
         arguments: Mapping[str, Any],
         checkpoint: Callable[[], None],
     ) -> Any:
-        # Klippy is multithreaded and imports NumPy/OpenBLAS before calibration.
-        # Forking that process can inherit a numerical-library lock whose owner
-        # thread no longer exists in the child.  Always start a clean interpreter
-        # so analysis cannot hang on inherited thread or allocator state.
-        context = multiprocessing.get_context("spawn")
-        # A Queue owns a feeder thread.  A child returning a sufficiently large
-        # value can block during interpreter shutdown until the parent drains
-        # that feeder, while the old parent loop waited for child shutdown
-        # before reading the Queue.  A one-way Connection plus concurrent
-        # polling avoids that circular wait and does not need a feeder thread.
-        output, child_output = context.Pipe(duplex=False)
-        process = context.Process(
-            target=_entry,
-            args=(child_output, function, arguments, self.memory_mb, self.cpu_seconds),
-            daemon=True,
+        # A standalone interpreter avoids inheriting Klippy's greenlet, thread,
+        # allocator, and numerical-library state.  Private files also avoid the
+        # bounded-pipe shutdown deadlocks possible with multiprocessing IPC.
+        work_dir = Path(
+            tempfile.mkdtemp(prefix="advanced-shaper-worker-", dir=self.temporary_root)
         )
+        os.chmod(work_dir, 0o700)
+        input_path = work_dir / "request.pickle"
+        result_path = work_dir / "result.pickle"
+        stderr_path = work_dir / "stderr.log"
+        process: Optional[subprocess.Popen[Any]] = None
+        stderr_handle = None
         try:
-            process.start()
-        except BaseException:
-            output.close()
-            child_output.close()
-            raise
-        child_output.close()
-        started = self.reactor.monotonic()
-        result: Any = None
-        received = False
-        try:
-            while True:
+            _private_pickle(input_path, (function, dict(arguments)))
+            stderr_descriptor = os.open(
+                str(stderr_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            stderr_handle = os.fdopen(stderr_descriptor, "wb")
+            command = [
+                sys.executable,
+                "-m",
+                "klipper_advanced_shaper.worker_child",
+                "--input",
+                str(input_path),
+                "--output",
+                str(result_path),
+                "--memory-mb",
+                str(self.memory_mb),
+                "--cpu-seconds",
+                str(self.cpu_seconds),
+            ]
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_handle,
+                shell=False,
+                close_fds=True,
+            )
+            started = self.reactor.monotonic()
+            while process.poll() is None:
                 checkpoint()
                 now = self.reactor.monotonic()
                 if now - started > self.timeout:
                     raise RuntimeError("analysis worker timed out")
-                if not received and output.poll(0.0):
-                    try:
-                        result = output.recv()
-                    except (EOFError, OSError) as error:
-                        raise RuntimeError(
-                            "analysis worker closed its result channel"
-                        ) from error
-                    received = True
-                if not process.is_alive():
-                    break
                 self.reactor.pause(now + 0.05)
-            process.join(timeout=1.0)
-            if not received and output.poll(0.1):
-                try:
-                    result = output.recv()
-                except (EOFError, OSError) as error:
-                    raise RuntimeError(
-                        "analysis worker closed its result channel"
-                    ) from error
-                received = True
-            if not received:
+
+            stderr_handle.close()
+            stderr_handle = None
+            if process.returncode != 0:
+                detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-8192:]
+                suffix = ":\n%s" % detail if detail else ""
                 raise RuntimeError(
-                    "analysis worker exited without a result (exit code %s)"
-                    % process.exitcode
+                    "analysis worker exited with code %s%s" % (process.returncode, suffix)
                 )
-            success, value = result
+            if not result_path.is_file():
+                raise RuntimeError("analysis worker exited without a result")
+            with result_path.open("rb") as stream:
+                success, value = pickle.load(stream)
             if not success:
                 raise RuntimeError("analysis worker failed:\n%s" % value)
             return value
         finally:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=1.0)
-            output.close()
+            try:
+                if process is not None:
+                    _stop_process(process)
+            finally:
+                if stderr_handle is not None:
+                    stderr_handle.close()
+                # Cleanup failure is intentionally not hidden: raw calibration
+                # inputs must not be silently left behind on the printer host.
+                shutil.rmtree(work_dir)

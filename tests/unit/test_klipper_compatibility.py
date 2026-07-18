@@ -1,5 +1,8 @@
-import multiprocessing
+import json
+import os
 import pickle
+import subprocess
+import sys
 import time
 
 import numpy as np
@@ -10,6 +13,12 @@ from klipper_advanced_shaper.artifacts import ArtifactWriter
 from klipper_advanced_shaper.klippy.adapter import KlipperPrinterAdapter
 from klipper_advanced_shaper.klippy.capture import _CaptureHelper
 from klipper_advanced_shaper.klippy.worker import SupervisedWorker
+from klipper_advanced_shaper.worker_child import (
+    diagnostic_failure,
+    diagnostic_numpy_payload,
+    diagnostic_sleep,
+    diagnostic_sum,
+)
 
 
 class _Samples:
@@ -157,20 +166,6 @@ def test_restore_attempts_velocity_when_shaper_restore_fails():
     assert adapter.gcode.commands[1].startswith("SET_VELOCITY_LIMIT")
 
 
-def _worker_sum(values):
-    return sum(values)
-
-
-def _worker_large_numpy_payload(size):
-    values = np.linspace(0.0, 16.0 * np.pi, size, dtype=np.float64)
-    payload = np.sin(values)
-    return {
-        "start_method": multiprocessing.get_start_method(),
-        "mean": float(np.mean(payload)),
-        "payload": payload,
-    }
-
-
 def test_supervised_worker_runs_callable_out_of_process():
     class Reactor:
         def monotonic(self):
@@ -180,13 +175,12 @@ def test_supervised_worker_runs_callable_out_of_process():
             time.sleep(max(0.0, min(0.02, until - time.monotonic())))
 
     result = SupervisedWorker(Reactor(), timeout=5, memory_mb=0, cpu_seconds=5).run(
-        _worker_sum, {"values": [1, 2, 3]}, lambda: None
+        diagnostic_sum, {"values": [1, 2, 3]}, lambda: None
     )
     assert result == 6
 
 
-def test_supervised_worker_drains_large_result_before_child_exit():
-    """A fresh spawn handles NumPy work and a result larger than a pipe buffer."""
+def test_supervised_worker_handles_large_numpy_result_in_external_interpreter(tmp_path):
 
     class Reactor:
         def monotonic(self):
@@ -196,18 +190,122 @@ def test_supervised_worker_drains_large_result_before_child_exit():
             time.sleep(max(0.0, min(0.02, until - time.monotonic())))
 
     size = 1024 * 1024
-    result = SupervisedWorker(Reactor(), timeout=10, memory_mb=0, cpu_seconds=5).run(
-        _worker_large_numpy_payload, {"size": size}, lambda: None
+    result = SupervisedWorker(
+        Reactor(), timeout=10, memory_mb=0, cpu_seconds=5, temporary_root=str(tmp_path)
+    ).run(
+        diagnostic_numpy_payload, {"size": size}, lambda: None
     )
-    assert result["start_method"] == "spawn"
+    assert result["pid"] != os.getpid()
     assert result["payload"].nbytes == 8 * 1024 * 1024
     assert abs(result["mean"]) < 1e-6
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_spawn_worker_callables_are_picklable(tmp_path):
+def test_external_worker_callables_are_picklable(tmp_path):
     writer = ArtifactWriter(tmp_path)
 
     assert pickle.loads(pickle.dumps(analyze_calibration)) is analyze_calibration
     restored_write = pickle.loads(pickle.dumps(writer.write))
     assert restored_write.__self__.root == tmp_path
     assert restored_write.__self__.keep_raw is True
+
+
+def test_supervised_worker_runs_artifact_writer_bound_method(tmp_path):
+    class Reactor:
+        def monotonic(self):
+            return time.monotonic()
+
+        def pause(self, until):
+            time.sleep(max(0.0, min(0.02, until - time.monotonic())))
+
+    temporary_root = tmp_path / "worker-temp"
+    temporary_root.mkdir()
+    writer = ArtifactWriter(tmp_path / "artifacts", keep_raw=False)
+    artifacts = SupervisedWorker(
+        Reactor(), timeout=15, memory_mb=0, cpu_seconds=10, temporary_root=str(temporary_root)
+    ).run(
+        writer.write,
+        {"result_id": "diagnostic", "report": {"schema_version": "test", "axes": {}}},
+        lambda: None,
+    )
+
+    assert temporary_root.exists()
+    assert list(temporary_root.iterdir()) == []
+    assert os.path.isfile(artifacts["json"])
+    assert os.path.isfile(artifacts["html"])
+
+
+def test_supervised_worker_returns_child_error_and_cleans_temp(tmp_path):
+    class Reactor:
+        def monotonic(self):
+            return time.monotonic()
+
+        def pause(self, until):
+            time.sleep(max(0.0, min(0.02, until - time.monotonic())))
+
+    worker = SupervisedWorker(
+        Reactor(), timeout=5, memory_mb=0, cpu_seconds=5, temporary_root=str(tmp_path)
+    )
+    with pytest.raises(RuntimeError, match="intentional diagnostic failure"):
+        worker.run(
+            diagnostic_failure,
+            {"message": "intentional diagnostic failure"},
+            lambda: None,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_supervised_worker_timeout_terminates_and_cleans_temp(tmp_path):
+    class Reactor:
+        def monotonic(self):
+            return time.monotonic()
+
+        def pause(self, until):
+            time.sleep(max(0.0, min(0.02, until - time.monotonic())))
+
+    worker = SupervisedWorker(
+        Reactor(), timeout=0.1, memory_mb=0, cpu_seconds=5, temporary_root=str(tmp_path)
+    )
+    with pytest.raises(RuntimeError, match="timed out"):
+        worker.run(diagnostic_sleep, {"seconds": 10.0}, lambda: None)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_supervised_worker_cancellation_terminates_and_cleans_temp(tmp_path):
+    class Reactor:
+        def monotonic(self):
+            return time.monotonic()
+
+        def pause(self, until):
+            time.sleep(max(0.0, min(0.02, until - time.monotonic())))
+
+    calls = 0
+
+    def checkpoint():
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise RuntimeError("cancelled by test")
+
+    worker = SupervisedWorker(
+        Reactor(), timeout=5, memory_mb=0, cpu_seconds=5, temporary_root=str(tmp_path)
+    )
+    with pytest.raises(RuntimeError, match="cancelled by test"):
+        worker.run(diagnostic_sleep, {"seconds": 10.0}, checkpoint)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_worker_child_direct_diagnostic_cli():
+    completed = subprocess.run(
+        [sys.executable, "-m", "klipper_advanced_shaper.worker_child", "--diagnostic"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is True
+    assert payload["boundary"] == "external-interpreter"
+    assert payload["pid"] != os.getpid()
+    assert payload["numpy_samples"] == 32768
+    assert abs(payload["mean"]) < 1e-5

@@ -57,6 +57,18 @@ To update an unmodified checkout with a fast-forward-only pull:
 ./scripts/update.sh
 ```
 
+Before calibration, the analysis interpreter boundary can be checked without
+connecting to the MCU or commanding any printer motion:
+
+```sh
+~/klippy-env/bin/python -m klipper_advanced_shaper.worker_child \
+  --diagnostic --memory-mb 1536 --cpu-seconds 30
+```
+
+Success prints JSON containing `"ok": true`, `"boundary":
+"external-interpreter"`, and a completed NumPy sample count. This diagnostic
+does not load Klippy, read accelerometer data, or issue G-code.
+
 ## Commands
 
 ```text
