@@ -157,6 +157,10 @@ def _worker_sum(values):
     return sum(values)
 
 
+def _worker_large_payload(size):
+    return b"x" * size
+
+
 def test_supervised_worker_runs_callable_out_of_process():
     class Reactor:
         def monotonic(self):
@@ -169,3 +173,22 @@ def test_supervised_worker_runs_callable_out_of_process():
         _worker_sum, {"values": [1, 2, 3]}, lambda: None
     )
     assert result == 6
+
+
+def test_supervised_worker_drains_large_result_before_child_exit():
+    """Regression: a result larger than a pipe buffer must not deadlock."""
+
+    class Reactor:
+        def monotonic(self):
+            return time.monotonic()
+
+        def pause(self, until):
+            time.sleep(max(0.0, min(0.02, until - time.monotonic())))
+
+    size = 8 * 1024 * 1024
+    result = SupervisedWorker(Reactor(), timeout=10, memory_mb=0, cpu_seconds=5).run(
+        _worker_large_payload, {"size": size}, lambda: None
+    )
+    assert len(result) == size
+    assert result[:1] == b"x"
+    assert result[-1:] == b"x"

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import multiprocessing
 import os
-import queue
 import traceback
 from typing import Any, Callable, Mapping
 
@@ -29,9 +28,15 @@ def _entry(
                 resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
         except (ImportError, OSError, ValueError):
             pass
-        output.put((True, function(**dict(arguments))))
+        output.send((True, function(**dict(arguments))))
     except BaseException:
-        output.put((False, traceback.format_exc()))
+        try:
+            output.send((False, traceback.format_exc()))
+        except (BrokenPipeError, EOFError, OSError):
+            # The parent may have cancelled or timed out while work was running.
+            pass
+    finally:
+        output.close()
 
 
 class SupervisedWorker:
@@ -56,26 +61,54 @@ class SupervisedWorker:
     ) -> Any:
         methods = multiprocessing.get_all_start_methods()
         context = multiprocessing.get_context("fork" if "fork" in methods else "spawn")
-        output = context.Queue(maxsize=1)
+        # A Queue owns a feeder thread.  A child returning a sufficiently large
+        # value can block during interpreter shutdown until the parent drains
+        # that feeder, while the old parent loop waited for child shutdown
+        # before reading the Queue.  A one-way Connection plus concurrent
+        # polling avoids that circular wait and does not need a feeder thread.
+        output, child_output = context.Pipe(duplex=False)
         process = context.Process(
             target=_entry,
-            args=(output, function, arguments, self.memory_mb, self.cpu_seconds),
+            args=(child_output, function, arguments, self.memory_mb, self.cpu_seconds),
             daemon=True,
         )
         process.start()
+        child_output.close()
         started = self.reactor.monotonic()
+        result: Any = None
+        received = False
         try:
-            while process.is_alive():
+            while True:
                 checkpoint()
                 now = self.reactor.monotonic()
                 if now - started > self.timeout:
                     raise RuntimeError("analysis worker timed out")
+                if not received and output.poll(0.0):
+                    try:
+                        result = output.recv()
+                    except (EOFError, OSError) as error:
+                        raise RuntimeError(
+                            "analysis worker closed its result channel"
+                        ) from error
+                    received = True
+                if not process.is_alive():
+                    break
                 self.reactor.pause(now + 0.05)
             process.join(timeout=1.0)
-            try:
-                success, value = output.get_nowait()
-            except queue.Empty as error:
-                raise RuntimeError("analysis worker exited without a result") from error
+            if not received and output.poll(0.1):
+                try:
+                    result = output.recv()
+                except (EOFError, OSError) as error:
+                    raise RuntimeError(
+                        "analysis worker closed its result channel"
+                    ) from error
+                received = True
+            if not received:
+                raise RuntimeError(
+                    "analysis worker exited without a result (exit code %s)"
+                    % process.exitcode
+                )
+            success, value = result
             if not success:
                 raise RuntimeError("analysis worker failed:\n%s" % value)
             return value

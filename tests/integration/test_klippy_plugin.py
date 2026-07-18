@@ -97,6 +97,22 @@ def test_capture_failure_restores_snapshot_and_records_failure():
     assert plugin.status()["state"] == "failed"
 
 
+def test_failed_calibration_can_retry_without_klipper_restart():
+    adapter = FakeAdapter(fail_capture_at=1)
+    plugin = AdvancedInputShaper(
+        adapter=adapter, analyzer=analyzer, id_factory=lambda: "retry-result"
+    )
+
+    with pytest.raises(RuntimeError, match="accelerometer disconnected"):
+        plugin.calibrate(("X",), repeats=1, validate=False)
+
+    result = plugin.calibrate(("X",), repeats=1, validate=False)
+
+    assert result.result_id == "retry-result"
+    assert plugin.status()["state"] == "review"
+    assert len([call for call in adapter.calls if call[0] == "restore"]) == 2
+
+
 def test_cancellation_restores_snapshot():
     adapter = FakeAdapter()
     plugin = AdvancedInputShaper(adapter=adapter, analyzer=analyzer)
