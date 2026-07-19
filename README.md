@@ -25,6 +25,11 @@ better only when a matched, repeatable benchmark demonstrates both a higher
 smoothing-derived acceleration estimate and lower held-out residual vibration.
 See [the benchmark protocol](docs/benchmarking.md).
 
+An offline, research-only optimizer also explores Klipper's parameterized
+generalized-MZV design space and a conservative acceleration envelope. It is
+not connected to `APPLY` or `STAGE`, and cannot change printer acceleration.
+See [experimental generalized MZV](docs/experimental-generalized-mzv.md).
+
 ## Install
 
 On the Klipper host, clone this repository somewhere outside the Klipper source
@@ -40,8 +45,12 @@ the usual `~/klipper` and `~/klippy-env` locations. It installs the Python
 package into Klipper's virtual environment and a small loader into
 `klippy/extras`. A differing existing loader is preserved with a `.previous`
 suffix. The installer does not restart Klipper or edit printer configuration.
+After every package install or update, restart the actual Klipper host service
+while the printer is idle (commonly `sudo systemctl restart klipper`). Klipper's
+G-code `RESTART` command is not sufficient to load updated Python package code.
 
-Add this section to `printer.cfg`, review it, and restart Klipper while idle:
+Add this section to `printer.cfg`, review it, and restart the Klipper host
+service while idle:
 
 ```ini
 [advanced_input_shaper]
@@ -91,6 +100,11 @@ reference result for the runtime before starting the session. The
 candidate is accepted only when the 95% confidence interval demonstrates at
 least 10% resonant-band attenuation. Every temporary setting is restored before
 the result becomes reviewable.
+
+A candidate rejected by held-out validation is never available to `APPLY` or
+`STAGE`. After the original printer state has been restored successfully, its
+private report retains the validation metrics and, when `keep_raw_data` is
+enabled, the training, reference, and candidate captures for diagnosis.
 
 ## Development
 

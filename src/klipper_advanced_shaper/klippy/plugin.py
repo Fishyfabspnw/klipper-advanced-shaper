@@ -55,6 +55,9 @@ class AdvancedInputShaper:
         self.machine = StateMachine()
         self.results: dict[str, CalibrationResult] = {}
         self.current_result_id: Optional[str] = None
+        self.current_attempt_id: Optional[str] = None
+        self.current_attempt_status: Optional[str] = None
+        self.current_attempt_artifacts: Optional[Mapping[str, Any]] = None
         if config is not None:
             self.minimum_max_accel = {
                 "X": config.getfloat("minimum_max_accel_x", 0.0, minval=0.0),
@@ -123,9 +126,20 @@ class AdvancedInputShaper:
         if not 1 <= repeats <= 20:
             raise ValueError("repeats must be between 1 and 20")
 
+        attempt_id = self.id_factory()
         self.machine.begin()
+        self.current_attempt_id = attempt_id
+        self.current_attempt_status = "running"
+        self.current_attempt_artifacts = None
+        # A previous accepted result remains addressable in ``results``, but it
+        # must not appear to be the outcome of this new attempt.
+        self.current_result_id = None
         snapshot = None
         result = None
+        operation_error: Optional[BaseException] = None
+        restore_error: Optional[BaseException] = None
+        rejection_report: Optional[Mapping[str, Any]] = None
+        rejection_raw_groups: Optional[Mapping[str, Mapping[str, list[Any]]]] = None
         captures: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
         try:
             self.adapter.preflight(normalized_axes)
@@ -202,11 +216,6 @@ class AdvancedInputShaper:
                     snapshot=snapshot,
                     prior_report=report,
                 )
-                if not validation_report.get("validation", {}).get("passed", False):
-                    raise RuntimeError(
-                        "candidate failed held-out validation: %s"
-                        % validation_report.get("validation", {}).get("reason", "attenuation gate")
-                    )
                 report = dict(report)
                 report["reference"] = [
                     {
@@ -217,22 +226,79 @@ class AdvancedInputShaper:
                     }
                     for item in reference
                 ]
-                report["validation"] = validation_report["validation"]
+                report["validation"] = validation_report.get("validation", {})
+                report["validation_report"] = dict(validation_report)
+                if not validation_report.get("validation", {}).get("passed", False):
+                    rejection_error = RuntimeError(
+                        "candidate failed held-out validation: %s"
+                        % validation_report.get("validation", {}).get("reason", "attenuation gate")
+                    )
+                    report.update(
+                        {
+                            "attempt_id": attempt_id,
+                            "status": "rejected",
+                            "reason": str(rejection_error),
+                        }
+                    )
+                    rejection_report = report
+                    rejection_raw_groups = {
+                        "training": captures,
+                        "reference": held_out,
+                        "candidate": validation,
+                    }
+                    raise rejection_error
 
-            result = CalibrationResult(self.id_factory(), selections, report)
-        except CalibrationCancelled:
-            self.machine.cancelled()
-            raise
+            report = dict(report)
+            report.update({"attempt_id": attempt_id, "status": "accepted"})
+            result = CalibrationResult(attempt_id, selections, report)
+        except CalibrationCancelled as error:
+            operation_error = error
         except BaseException as error:
-            self.machine.failed(error)
-            raise
+            operation_error = error
         finally:
             if snapshot is not None:
                 try:
                     self.adapter.restore(snapshot)
-                except BaseException as restore_error:
-                    self.machine.failed(restore_error)
-                    raise
+                except BaseException as error:
+                    restore_error = error
+
+        if restore_error is not None:
+            if operation_error is not None:
+                failure = RuntimeError(
+                    "%s; printer state restoration also failed: %s"
+                    % (operation_error, restore_error)
+                )
+            else:
+                failure = restore_error
+            self.current_attempt_status = "failed"
+            self.machine.failed(failure)
+            raise failure from restore_error
+
+        if isinstance(operation_error, CalibrationCancelled):
+            self.current_attempt_status = "cancelled"
+            self.machine.cancelled()
+            raise operation_error
+
+        if operation_error is not None:
+            if rejection_report is not None and self.artifact_writer is not None:
+                try:
+                    self.current_attempt_artifacts = self._invoke(
+                        self.artifact_writer.write,
+                        result_id=attempt_id,
+                        report=rejection_report,
+                        raw_groups=rejection_raw_groups,
+                    )
+                except BaseException as artifact_error:
+                    failure = RuntimeError(
+                        "%s; rejected-attempt artifact write failed: %s"
+                        % (operation_error, artifact_error)
+                    )
+                    self.current_attempt_status = "failed"
+                    self.machine.failed(failure)
+                    raise failure from artifact_error
+            self.current_attempt_status = "rejected" if rejection_report is not None else "failed"
+            self.machine.failed(operation_error)
+            raise operation_error
 
         # A result is not reviewable until restoration has succeeded.
         assert result is not None
@@ -250,11 +316,14 @@ class AdvancedInputShaper:
                 enriched = dict(result.report)
                 enriched["artifacts"] = artifacts
                 result = CalibrationResult(result.result_id, result.selections, enriched)
+                self.current_attempt_artifacts = artifacts
             except BaseException as artifact_error:
+                self.current_attempt_status = "failed"
                 self.machine.failed(artifact_error)
                 raise
         self.results[result.result_id] = result
         self.current_result_id = result.result_id
+        self.current_attempt_status = "accepted"
         self.machine.transition(CalibrationState.REVIEW)
         return result
 
@@ -296,6 +365,9 @@ class AdvancedInputShaper:
         return {
             "state": self.machine.state.value,
             "result_id": self.current_result_id,
+            "attempt_id": self.current_attempt_id,
+            "attempt_status": self.current_attempt_status,
+            "artifacts": self.current_attempt_artifacts,
             "cancel_requested": self.machine.cancel_requested,
             "error": self.machine.error,
         }

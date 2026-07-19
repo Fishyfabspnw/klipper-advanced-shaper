@@ -16,6 +16,10 @@ from .signal import assess_quality, resample_uniform
 from .spectral import aggregate_spectra, integrated_band_energy, welch_psd
 from .statistics import attenuation_improvement_ci
 
+_MAX_NATIVE_BINS = 1024
+_MAX_SPECTROGRAM_FREQUENCIES = 256
+_MAX_SPECTROGRAM_TIMES = 192
+
 
 def _samples(capture: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     values = np.asarray(capture["samples"], dtype=float)
@@ -100,6 +104,172 @@ def _candidate_scores(
             )
         )
     return scores
+
+
+def _common_grid(rows: Sequence[Mapping[str, Any]], frequency_key: str) -> np.ndarray:
+    grids = [np.asarray(row[frequency_key], dtype=float) for row in rows]
+    lower = max(float(grid[0]) for grid in grids)
+    upper = min(float(grid[-1]) for grid in grids)
+    reference = min(grids, key=lambda grid: np.count_nonzero((grid >= lower) & (grid <= upper)))
+    grid = reference[(reference >= lower) & (reference <= upper)]
+    if grid.size < 2:
+        raise ValueError("native spectra have no common frequency range")
+    if grid.size > _MAX_NATIVE_BINS:
+        indices = np.linspace(0, grid.size - 1, _MAX_NATIVE_BINS, dtype=int)
+        grid = grid[indices]
+    return grid
+
+
+def _native_spectrum_summary(captures: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    required = ("frequency_hz", "psd_sum", "psd_x", "psd_y", "psd_z")
+    rows = [capture.get("native_spectrum") for capture in captures]
+    if not rows or any(not isinstance(row, Mapping) for row in rows):
+        return {"available": False, "reason": "native CalibrationData spectrum unavailable"}
+    unavailable = [
+        str(row.get("reason", "native spectrum unavailable"))
+        for row in rows
+        if not row.get("available", True)
+    ]
+    if unavailable:
+        return {"available": False, "reason": unavailable[0]}
+    try:
+        for row in rows:
+            frequency = np.asarray(row["frequency_hz"], dtype=float)
+            if frequency.ndim != 1 or frequency.size < 2 or np.any(np.diff(frequency) <= 0):
+                raise ValueError("invalid native frequency bins")
+            for key in required[1:]:
+                values = np.asarray(row[key], dtype=float)
+                if values.shape != frequency.shape or not np.all(np.isfinite(values)):
+                    raise ValueError("invalid native PSD component")
+        grid = _common_grid(rows, "frequency_hz")
+        result: dict[str, Any] = {
+            "available": True,
+            "source": "running_klipper_normalized_calibration_data",
+            "frequency_hz": grid.tolist(),
+            "repeat_count": len(rows),
+        }
+        for key in required[1:]:
+            matrix = np.vstack(
+                [
+                    np.interp(grid, row["frequency_hz"], np.asarray(row[key], dtype=float))
+                    for row in rows
+                ]
+            )
+            result[key] = np.median(matrix, axis=0).tolist()
+        return result
+    except (KeyError, TypeError, ValueError) as error:
+        return {"available": False, "reason": str(error)}
+
+
+def _native_candidate_summary(captures: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for capture in captures:
+        for item in capture.get("native_candidates", []):
+            grouped.setdefault(str(item["name"]).lower(), []).append(item)
+    result = []
+    for name, rows in sorted(grouped.items()):
+        summary: dict[str, Any] = {
+            "name": name,
+            "frequency_hz": float(np.median([row["frequency"] for row in rows])),
+            "residual_vibration": float(np.median([row["residual_vibration"] for row in rows])),
+            "smoothing": float(np.median([row["smoothing"] for row in rows])),
+            "max_accel": float(np.median([row["max_accel"] for row in rows])),
+            "repeat_count": len(rows),
+        }
+        responses = [row.get("native_frequency_response") for row in rows]
+        if responses and all(isinstance(response, Mapping) for response in responses):
+            try:
+                grid = _common_grid(responses, "frequency_hz")
+                matrix = np.vstack(
+                    [
+                        np.interp(
+                            grid,
+                            response["frequency_hz"],
+                            np.asarray(response["response_ratio"], dtype=float),
+                        )
+                        for response in responses
+                    ]
+                )
+                if np.all(np.isfinite(matrix)):
+                    summary["native_frequency_response"] = {
+                        "frequency_hz": grid.tolist(),
+                        "response_ratio": np.median(matrix, axis=0).tolist(),
+                    }
+            except (KeyError, TypeError, ValueError):
+                pass
+        result.append(summary)
+    return result
+
+
+def _spectrogram(capture: Mapping[str, Any], axis: str) -> dict[str, Any]:
+    if int(capture.get("dataset_count", 1)) != 1:
+        return {
+            "available": False,
+            "reason": "multiple probe sweeps do not share one excitation time axis",
+        }
+    recipe = capture.get("metadata", {}).get("test_recipe", {})
+    try:
+        start_frequency = float(recipe["freq_start"])
+        end_frequency = float(recipe["freq_end"])
+        sweep_rate = float(recipe["hz_per_sec"])
+    except (KeyError, TypeError, ValueError):
+        return {"available": False, "reason": "timestamped sweep recipe unavailable"}
+    if start_frequency < 0 or end_frequency <= start_frequency or sweep_rate <= 0:
+        return {"available": False, "reason": "invalid sweep recipe"}
+    try:
+        timestamps, acceleration = _samples(capture)
+        uniform_time, uniform, rate = resample_uniform(timestamps, acceleration)
+        axis_index = 0 if axis == "X" else 1
+        signal = uniform[:, axis_index]
+        target = max(64, int(rate * 0.25))
+        size = min(1024, 1 << max(6, int(np.floor(np.log2(target)))))
+        if signal.size < 2 * size:
+            raise ValueError("capture is too short for a stable spectrogram")
+        step = max(1, size // 4)
+        starts = np.arange(0, signal.size - size + 1, step, dtype=int)
+        window = np.hanning(size)
+        scale = rate * np.sum(window**2)
+        columns = []
+        for offset in starts:
+            segment = signal[offset : offset + size]
+            transformed = np.fft.rfft((segment - np.mean(segment)) * window)
+            power = np.abs(transformed) ** 2 / scale
+            power[1:-1] *= 2.0
+            columns.append(power)
+        frequencies = np.fft.rfftfreq(size, 1.0 / rate)
+        matrix = np.asarray(columns, dtype=float).T
+        frequency_mask = frequencies <= min(rate * 0.5, end_frequency + 20.0)
+        frequencies = frequencies[frequency_mask]
+        matrix = matrix[frequency_mask]
+        times = uniform_time[starts + size // 2] - uniform_time[0]
+        if frequencies.size > _MAX_SPECTROGRAM_FREQUENCIES:
+            indices = np.linspace(
+                0, frequencies.size - 1, _MAX_SPECTROGRAM_FREQUENCIES, dtype=int
+            )
+            frequencies = frequencies[indices]
+            matrix = matrix[indices]
+        if times.size > _MAX_SPECTROGRAM_TIMES:
+            indices = np.linspace(0, times.size - 1, _MAX_SPECTROGRAM_TIMES, dtype=int)
+            times = times[indices]
+            matrix = matrix[:, indices]
+        if not np.all(np.isfinite(matrix)):
+            raise ValueError("spectrogram contains non-finite power")
+        return {
+            "available": True,
+            "source": "timestamp_resampled_sweep",
+            "axis": axis,
+            "frequency_hz": frequencies.tolist(),
+            "time_s": times.tolist(),
+            "power": matrix.tolist(),
+            "power_shape": [int(matrix.shape[0]), int(matrix.shape[1])],
+            "test_recipe": {
+                "freq_start": start_frequency,
+                "freq_end": end_frequency,
+                "hz_per_sec": sweep_rate,
+            },
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        return {"available": False, "reason": str(error)}
 
 
 def _energies(
@@ -211,8 +381,11 @@ def analyze_calibration(
             "qc": quality,
             "modes": [asdict(mode) for mode in modes],
             "candidates": [asdict(item) for item in scores],
+            "native_candidates": _native_candidate_summary(captures[axis]),
             "pareto": [item.name for item in chosen.frontier],
             "selected": chosen.selected.name,
+            "native_spectrum": _native_spectrum_summary(captures[axis]),
+            "spectrogram": _spectrogram(captures[axis][0], axis),
             "spectrum": {
                 "frequency_hz": aggregate.frequencies[::stride].tolist(),
                 "psd": aggregate.values[::stride].tolist(),

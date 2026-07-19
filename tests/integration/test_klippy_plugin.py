@@ -70,6 +70,48 @@ def analyzer(**kwargs):
     }
 
 
+def rejecting_analyzer(**kwargs):
+    if "validation_captures" in kwargs:
+        return {
+            "qc": {"passed": True, "held_out_repeats": 2},
+            "validation": {
+                "passed": False,
+                "reason": "confidence interval below target",
+                "axes": {
+                    "X": {
+                        "baseline_energy": 12.0,
+                        "shaped_energy": 11.4,
+                        "improvement_ci_95": [0.01, 0.09],
+                        "cross_axis_regression": 0.02,
+                        "passed": False,
+                    }
+                },
+            }
+        }
+    return {
+        "selections": [{"axis": "X", "shaper_type": "mzv", "frequency_hz": 71.5}],
+        "qc": {"passed": True, "dropout_ratio": 0.0},
+        "provenance": {"engine": "test-native"},
+        "axes": {"X": {"selected": "mzv", "candidates": []}},
+    }
+
+
+@dataclass
+class RecordingArtifactWriter:
+    adapter: FakeAdapter
+    fail: bool = False
+    calls: list = field(default_factory=list)
+
+    def write(self, result_id, report, raw_groups=None):
+        self.adapter.calls.append(("artifact", result_id))
+        self.calls.append(
+            {"result_id": result_id, "report": report, "raw_groups": raw_groups}
+        )
+        if self.fail:
+            raise RuntimeError("artifact disk full")
+        return {"json": "/private/result.json", "raw": "/private/captures.npz"}
+
+
 def test_calibration_validates_held_out_data_and_always_restores():
     adapter = FakeAdapter()
     plugin = AdvancedInputShaper(adapter=adapter, analyzer=analyzer, id_factory=lambda: "result-1")
@@ -111,6 +153,128 @@ def test_failed_calibration_can_retry_without_klipper_restart():
     assert result.result_id == "retry-result"
     assert plugin.status()["state"] == "review"
     assert len([call for call in adapter.calls if call[0] == "restore"]) == 2
+
+
+def test_rejected_validation_is_written_only_after_rollback_with_full_diagnostics():
+    adapter = FakeAdapter()
+    writer = RecordingArtifactWriter(adapter)
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=rejecting_analyzer,
+        artifact_writer=writer,
+        id_factory=lambda: "rejected-attempt",
+    )
+
+    with pytest.raises(RuntimeError, match="confidence interval below target"):
+        plugin.calibrate(("X",), repeats=2, validate=True)
+
+    assert adapter.calls.index(("restore", SNAPSHOT)) < adapter.calls.index(
+        ("artifact", "rejected-attempt")
+    )
+    written = writer.calls[0]
+    assert written["report"]["status"] == "rejected"
+    assert written["report"]["attempt_id"] == "rejected-attempt"
+    assert written["report"]["qc"]["passed"] is True
+    assert written["report"]["provenance"]["engine"] == "test-native"
+    assert written["report"]["validation"]["axes"]["X"]["baseline_energy"] == 12.0
+    assert written["report"]["validation_report"]["qc"]["held_out_repeats"] == 2
+    assert set(written["raw_groups"]) == {"training", "reference", "candidate"}
+    assert all(len(written["raw_groups"][group]["X"]) == 2 for group in written["raw_groups"])
+    assert "rejected-attempt" not in plugin.results
+    with pytest.raises(ValueError, match="unknown result"):
+        plugin.apply("rejected-attempt")
+    with pytest.raises(ValueError, match="unknown result"):
+        plugin.stage("rejected-attempt")
+    assert plugin.status() == {
+        "state": "failed",
+        "result_id": None,
+        "attempt_id": "rejected-attempt",
+        "attempt_status": "rejected",
+        "artifacts": {"json": "/private/result.json", "raw": "/private/captures.npz"},
+        "cancel_requested": False,
+        "error": "candidate failed held-out validation: confidence interval below target",
+    }
+
+
+def test_new_rejected_attempt_does_not_expose_stale_accepted_result_id():
+    adapter = FakeAdapter()
+    writer = RecordingArtifactWriter(adapter)
+    attempts = iter(("accepted-result", "rejected-result"))
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=rejecting_analyzer,
+        artifact_writer=writer,
+        id_factory=lambda: next(attempts),
+    )
+    plugin.calibrate(("X",), repeats=1, validate=False)
+    assert plugin.status()["result_id"] == "accepted-result"
+
+    with pytest.raises(RuntimeError, match="failed held-out validation"):
+        plugin.calibrate(("X",), repeats=1, validate=True)
+
+    assert "accepted-result" in plugin.results
+    assert plugin.status()["result_id"] is None
+    assert plugin.status()["attempt_id"] == "rejected-result"
+
+
+def test_rejection_artifact_failure_reports_both_errors_after_rollback():
+    adapter = FakeAdapter()
+    writer = RecordingArtifactWriter(adapter, fail=True)
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=rejecting_analyzer,
+        artifact_writer=writer,
+        id_factory=lambda: "artifact-failure",
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        plugin.calibrate(("X",), repeats=1, validate=True)
+
+    assert "confidence interval below target" in str(raised.value)
+    assert "artifact disk full" in str(raised.value)
+    assert adapter.calls.index(("restore", SNAPSHOT)) < adapter.calls.index(
+        ("artifact", "artifact-failure")
+    )
+    assert plugin.status()["attempt_status"] == "failed"
+    assert "artifact disk full" in plugin.status()["error"]
+    assert "artifact-failure" not in plugin.results
+
+
+def test_rejection_rollback_failure_prevents_artifact_write_and_reports_both_errors():
+    adapter = FakeAdapter(fail_restore=True)
+    writer = RecordingArtifactWriter(adapter)
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=rejecting_analyzer,
+        artifact_writer=writer,
+        id_factory=lambda: "rollback-failure",
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        plugin.calibrate(("X",), repeats=1, validate=True)
+
+    assert "confidence interval below target" in str(raised.value)
+    assert "restoration also failed: restore failed" in str(raised.value)
+    assert writer.calls == []
+    assert "restore failed" in plugin.status()["error"]
+    assert plugin.status()["attempt_status"] == "failed"
+
+
+def test_capture_failure_does_not_persist_partial_raw_data():
+    adapter = FakeAdapter(fail_capture_at=2)
+    writer = RecordingArtifactWriter(adapter)
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=analyzer,
+        artifact_writer=writer,
+        id_factory=lambda: "partial-capture",
+    )
+
+    with pytest.raises(RuntimeError, match="accelerometer disconnected"):
+        plugin.calibrate(("X",), repeats=3, validate=True)
+
+    assert writer.calls == []
+    assert plugin.status()["artifacts"] is None
 
 
 def test_cancellation_restores_snapshot():

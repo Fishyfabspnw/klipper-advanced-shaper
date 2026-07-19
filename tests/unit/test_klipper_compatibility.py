@@ -11,7 +11,11 @@ import pytest
 from klipper_advanced_shaper.analysis import analyze_calibration
 from klipper_advanced_shaper.artifacts import ArtifactWriter
 from klipper_advanced_shaper.klippy.adapter import KlipperPrinterAdapter
-from klipper_advanced_shaper.klippy.capture import _CaptureHelper
+from klipper_advanced_shaper.klippy.capture import (
+    _CaptureHelper,
+    _native_candidate,
+    _native_spectrum,
+)
 from klipper_advanced_shaper.klippy.worker import SupervisedWorker
 from klipper_advanced_shaper.worker_child import (
     diagnostic_failure,
@@ -47,6 +51,106 @@ def test_capture_result_combines_multiple_probe_points_without_timestamp_gap():
     first.add_data(second)
     assert first["dataset_count"] == 2
     assert np.all(np.diff(first["samples"][:, 0]) > 0)
+
+
+def test_native_calibration_components_preserve_fidelity_with_bounded_downsampling():
+    size = 2501
+    frequency = np.linspace(0.0, 250.0, size)
+
+    class CalibrationData:
+        freq_bins = frequency
+        psd_x = frequency + 1.0
+        psd_y = frequency + 2.0
+        psd_z = frequency + 3.0
+        psd_sum = psd_x + psd_y + psd_z
+
+    result = _native_spectrum(CalibrationData())
+    indices = np.linspace(0, size - 1, 1024, dtype=int)
+
+    assert result["normalized"] is True
+    assert result["available"] is True
+    assert result["source_bins"] == size
+    assert result["reported_bins"] == 1024
+    assert result["frequency_hz"] == pytest.approx(frequency[indices])
+    assert result["psd_x"] == pytest.approx((frequency + 1.0)[indices])
+    assert np.asarray(result["psd_sum"]) == pytest.approx(
+        np.asarray(result["psd_x"])
+        + np.asarray(result["psd_y"])
+        + np.asarray(result["psd_z"])
+    )
+
+
+def test_missing_native_display_components_are_optional():
+    class IncompatibleCalibrationData:
+        freq_bins = np.arange(4.0)
+        psd_sum = np.ones(4)
+        psd_x = np.ones(4)
+        psd_y = np.ones(4)
+
+    result = _native_spectrum(IncompatibleCalibrationData())
+    assert result["available"] is False
+    assert "missing display fields: psd_z" in result["reason"]
+
+    class MalformedCalibrationData:
+        freq_bins = np.arange(4.0)
+        psd_sum = np.ones(4)
+        psd_x = np.ones(4)
+        psd_y = np.ones(4)
+        psd_z = np.ones(3)
+
+    malformed = _native_spectrum(MalformedCalibrationData())
+    assert malformed["available"] is False
+    assert "mismatched shapes" in malformed["reason"]
+
+
+def test_current_native_candidate_uses_its_own_response_grid():
+    calibration_frequency = np.linspace(5.0, 200.0, 1200)
+    candidate_frequency = np.linspace(10.0, 140.0, 321)
+    candidate = type(
+        "Candidate",
+        (),
+        {
+            "name": "mzv",
+            "freq": 74.2,
+            "vibrs": 0.04,
+            "smoothing": 0.08,
+            "max_accel": 17000.0,
+            "freq_bins": candidate_frequency,
+            "vals": np.exp(-candidate_frequency / 100.0),
+        },
+    )()
+    result = _native_candidate(candidate, calibration_frequency, 150.0)
+    response = result["native_frequency_response"]
+    assert response["frequency_hz"] == pytest.approx(candidate_frequency)
+    assert response["response_ratio"] == pytest.approx(candidate.vals)
+
+
+def test_v013_native_candidate_uses_calibration_grid_filtered_to_max_frequency():
+    calibration_frequency = np.linspace(5.0, 200.0, 1200)
+    max_frequency = 150.0
+    filtered = calibration_frequency[calibration_frequency <= max_frequency]
+    candidate = type(
+        "LegacyCandidate",
+        (),
+        {
+            "name": "mzv",
+            "freq": 74.2,
+            "vibrs": 0.04,
+            "smoothing": 0.08,
+            "max_accel": 17000.0,
+            "vals": np.exp(-filtered / 100.0),
+        },
+    )()
+    result = _native_candidate(candidate, calibration_frequency, max_frequency)
+    response = result["native_frequency_response"]
+    assert response["frequency_hz"] == pytest.approx(filtered)
+    assert response["response_ratio"] == pytest.approx(candidate.vals)
+
+    candidate.vals = np.ones(3)
+    assert "native_frequency_response" not in _native_candidate(
+        candidate, calibration_frequency, max_frequency
+    )
+    assert "native_frequency_response" not in _native_candidate(candidate)
 
 
 def test_snapshot_falls_back_to_v013_axis_params_and_restore_velocity():

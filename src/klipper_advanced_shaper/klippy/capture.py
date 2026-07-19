@@ -9,6 +9,90 @@ from typing import Any
 
 import numpy as np
 
+_MAX_REPORT_FREQUENCY_BINS = 1024
+
+
+def _bounded_indices(size: int, limit: int = _MAX_REPORT_FREQUENCY_BINS) -> np.ndarray:
+    if size <= 0:
+        raise RuntimeError("native calibration spectrum is empty")
+    return np.linspace(0, size - 1, min(size, limit), dtype=int)
+
+
+def _native_spectrum(data: Any) -> dict[str, Any]:
+    """Best-effort copy of display-only normalized CalibrationData arrays."""
+    required = ("freq_bins", "psd_sum", "psd_x", "psd_y", "psd_z")
+    missing = [name for name in required if not hasattr(data, name)]
+    if missing:
+        return {"available": False, "reason": "missing display fields: %s" % ",".join(missing)}
+    try:
+        arrays = {name: np.asarray(getattr(data, name), dtype=float) for name in required}
+        frequencies = arrays["freq_bins"]
+        if frequencies.ndim != 1 or frequencies.size < 2 or np.any(np.diff(frequencies) <= 0):
+            raise ValueError("invalid frequency bins")
+        if any(value.shape != frequencies.shape for value in arrays.values()):
+            raise ValueError("display fields have mismatched shapes")
+        if any(not np.all(np.isfinite(value)) for value in arrays.values()):
+            raise ValueError("display fields contain non-finite values")
+        indices = _bounded_indices(frequencies.size)
+        return {
+            "available": True,
+            "schema": "klipper_calibration_data_v1",
+            "normalized": True,
+            "source_bins": int(frequencies.size),
+            "reported_bins": int(indices.size),
+            "frequency_hz": frequencies[indices].tolist(),
+            "psd_sum": arrays["psd_sum"][indices].tolist(),
+            "psd_x": arrays["psd_x"][indices].tolist(),
+            "psd_y": arrays["psd_y"][indices].tolist(),
+            "psd_z": arrays["psd_z"][indices].tolist(),
+        }
+    except (TypeError, ValueError) as error:
+        return {"available": False, "reason": str(error)}
+
+
+def _native_candidate(
+    item: Any, calibration_frequency_bins: Any = None, max_frequency: Any = None
+) -> dict[str, Any]:
+    result = {
+        "name": item.name,
+        "frequency": float(item.freq),
+        "residual_vibration": float(item.vibrs),
+        "smoothing": float(item.smoothing),
+        "max_accel": float(item.max_accel),
+    }
+    if hasattr(item, "vals"):
+        try:
+            candidate_bins = getattr(item, "freq_bins", None)
+            if candidate_bins is not None:
+                frequencies = np.asarray(candidate_bins, dtype=float)
+            elif calibration_frequency_bins is not None:
+                frequencies = np.asarray(calibration_frequency_bins, dtype=float)
+                if frequencies.ndim == 1 and max_frequency is not None:
+                    cutoff = float(max_frequency)
+                    if not np.isfinite(cutoff):
+                        raise ValueError("invalid maximum calibration frequency")
+                    frequencies = frequencies[frequencies <= cutoff]
+            else:
+                frequencies = np.asarray([], dtype=float)
+            response = np.asarray(item.vals, dtype=float)
+            if (
+                frequencies.ndim == 1
+                and frequencies.size >= 2
+                and response.shape == frequencies.shape
+                and np.all(np.isfinite(frequencies))
+                and np.all(np.isfinite(response))
+                and np.all(np.diff(frequencies) > 0)
+            ):
+                indices = _bounded_indices(frequencies.size)
+                result["native_frequency_response"] = {
+                    "frequency_hz": frequencies[indices].tolist(),
+                    "response_ratio": response[indices].tolist(),
+                    "source_bins": int(frequencies.size),
+                }
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return result
+
 
 class _Command:
     def __init__(self, validation: bool, responder: Any) -> None:
@@ -120,25 +204,25 @@ class NativeResonanceCaptureProvider:
         result = tester._run_test(command, [test_axis], helper, **run_kwargs)[test_axis]
         data = result["native_data"]
         data.normalize_to_frequencies()
+        result["native_spectrum"] = _native_spectrum(data)
         eventtime = self.printer.get_reactor().monotonic()
         scv = self.printer.lookup_object("toolhead").get_status(eventtime)["square_corner_velocity"]
+        max_frequency = tester._get_max_calibration_freq()
         _best, candidates = native_helper.find_best_shaper(
             data,
             max_smoothing=getattr(tester, "max_smoothing", None),
             scv=scv,
-            max_freq=tester._get_max_calibration_freq(),
+            max_freq=max_frequency,
             logger=lambda _message: None,
         )
         result["axis"] = axis.upper()
         result["validation"] = bool(validation)
         result["native_candidates"] = [
-            {
-                "name": item.name,
-                "frequency": float(item.freq),
-                "residual_vibration": float(item.vibrs),
-                "smoothing": float(item.smoothing),
-                "max_accel": float(item.max_accel),
-            }
+            _native_candidate(
+                item,
+                getattr(data, "freq_bins", None),
+                max_frequency,
+            )
             for item in candidates
         ]
         start_args = (

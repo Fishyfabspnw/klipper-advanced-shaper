@@ -22,4 +22,5 @@ fi
 install -m 0644 "${loader_source}" "${loader_target}"
 
 echo "Installed Klipper Advanced Shaper. Add [advanced_input_shaper] to printer.cfg."
-echo "Review changes, then restart Klipper yourself when the printer is idle."
+echo "Restart the Klipper host service while idle (often: sudo systemctl restart klipper)."
+echo "Klipper's G-code RESTART does not reload updated Python package code."
