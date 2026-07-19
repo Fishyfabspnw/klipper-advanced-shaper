@@ -49,6 +49,25 @@ Therefore `ei(v_tol=...)` remains research-only. These results do not prove a
 future parameterized EI search can never work; they show that exposing the
 current search at runtime would not be evidence-supported for these captures.
 
+## Three-repeat production-gate run
+
+After deploying the stock-baseline-first gate, the supervised printer was
+tested again with `REPEATS=3`, `FAST_VALIDATION=0`, `ACCEL_PER_HZ=175`,
+`HZ_PER_SEC=2`, `SCV=15`, and `PEAK_LOCK=1`. X attempt `aa4ab52d23cc` and Y
+attempt `f1ac9236285c` both completed the three stock-baseline sweeps and
+abstained before candidate `SET_INPUT_SHAPER` or held-out motion.
+
+| Axis | Strongest generalized candidate | Exact configured reference | Best eligible stock | Result |
+| --- | --- | ---: | ---: | --- |
+| X | `mzv(n=10,t=0.550000)` at 72.455 Hz / 0.08696 damping, 17,471 mm/s^2 theoretical | MZV, 16,678 mm/s^2 | ZV, 19,491 mm/s^2 | +4.75% vs configured, -10.37% vs stronger stock comparator; no upgrade |
+| Y | `mzv(n=3,t=0.550000)` at 48.828 Hz / 0.13942 damping, 6,153 mm/s^2 theoretical | MZV, 5,965 mm/s^2 | 3HUMP_EI, 4,425 mm/s^2 | +3.15% vs stronger configured comparator; no upgrade |
+
+The installed Klipper capability proof passed for the 10-pulse single-pass
+executor, parameterized initialization, the frequency-assignment fix, and the
+`max_vibrations=0.10` native fitting call. Both attempts restored the exact
+native X/Y identifiers, frequencies, damping ratios, velocity limits, and
+square-corner velocity. The printer configuration hash remained unchanged.
+
 ## Decision
 
 The plugin must not select a modified family merely because it is the best
