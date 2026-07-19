@@ -725,9 +725,29 @@ class ArtifactWriter:
                 bbox_to_anchor=(1.01, 0.5), borderaxespad=0.0,
             )
         else:
-            plots[2].set_xticks(positions, ["Validation pending"])
+            screen = report.get("theoretical_spectral_non_regression", {})
+            preflight_rejected = (
+                isinstance(screen, Mapping) and screen.get("passed") is False
+            )
+            calibration_failed = report.get("status") in {"failed", "rejected"}
+            if preflight_rejected:
+                tick_label = "Preflight rejected"
+                unavailable_message = (
+                    "Held-out validation was not run\n"
+                    "theoretical non-regression screen rejected the candidate"
+                )
+                unavailable_status = "NOT RUN · PREFLIGHT REJECTED"
+            elif calibration_failed:
+                tick_label = "Calibration rejected"
+                unavailable_message = "Held-out validation was not completed"
+                unavailable_status = "NOT RUN · REJECTED"
+            else:
+                tick_label = "Validation pending"
+                unavailable_message = "Held-out validation is not available"
+                unavailable_status = "PENDING"
+            plots[2].set_xticks(positions, [tick_label])
             plots[2].text(
-                0.5, 0.5, "Held-out validation is not available", ha="center", va="center",
+                0.5, 0.5, unavailable_message, ha="center", va="center",
                 transform=plots[2].transAxes, color=SLATE,
             )
             plots[2].set(
@@ -735,7 +755,7 @@ class ArtifactWriter:
                     "Held-out paired ring-down validation"
                     if transient_validation
                     else "Held-out paired validation"
-                ) + " · PENDING",
+                ) + " · " + unavailable_status,
                 ylabel="Normalized resonant-band energy",
             )
         plots[2].grid(True, axis="y")

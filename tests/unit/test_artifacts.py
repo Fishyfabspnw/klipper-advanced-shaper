@@ -401,6 +401,40 @@ def test_sparse_report_generates_all_visuals_with_pending_labels(tmp_path):
         assert (output / name).stat().st_size > 100
 
 
+def test_preflight_rejection_chart_never_claims_validation_is_pending(
+    tmp_path, monkeypatch
+):
+    from matplotlib.axes import Axes
+
+    report = _complete_report("rejected")
+    report["validation"] = {}
+    report["validation_protocol"] = {
+        "promotion_gate": "finite_reversal_ringdown_v1"
+    }
+    report["theoretical_spectral_non_regression"] = {"passed": False}
+    titles = []
+    labels = []
+    original_set = Axes.set
+    original_text = Axes.text
+
+    def record_set(self, **kwargs):
+        if "title" in kwargs:
+            titles.append(kwargs["title"])
+        return original_set(self, **kwargs)
+
+    def record_text(self, x, y, value, *args, **kwargs):
+        labels.append(str(value))
+        return original_text(self, x, y, value, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "set", record_set)
+    monkeypatch.setattr(Axes, "text", record_text)
+    ArtifactWriter(tmp_path, keep_raw=False).write("preflight-rejected", report)
+
+    assert any("NOT RUN · PREFLIGHT REJECTED" in title for title in titles)
+    assert any("theoretical non-regression screen rejected" in label for label in labels)
+    assert not any("PENDING" in title for title in titles)
+
+
 def test_parameterized_identifier_and_acceleration_evidence_are_preserved(tmp_path):
     report = _complete_report()
     identifier = "mzv(n=4,t=0.800000)"
