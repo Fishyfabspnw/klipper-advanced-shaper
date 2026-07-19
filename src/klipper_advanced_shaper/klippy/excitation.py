@@ -7,7 +7,7 @@ import re
 from typing import Any, Mapping, Optional
 
 MIN_ACCEL_PER_HZ = 20.0
-MAX_ACCEL_PER_HZ = 150.0
+MAX_ACCEL_PER_HZ = 350.0
 MIN_HZ_PER_SEC = 0.1
 MAX_HZ_PER_SEC = 2.0
 MOTION_LIMIT_FRACTION = 0.80
@@ -24,11 +24,11 @@ def parse_accel_per_hz(value: Any) -> Optional[float]:
     if not _STRICT_DECIMAL.fullmatch(text):
         raise ValueError(
             "ACCEL_PER_HZ must be CONFIG or an unsigned decimal between "
-            "20 and 150 mm/s^2/Hz"
+            "20 and 350 mm/s^2/Hz"
         )
     parsed = float(text)
     if not math.isfinite(parsed) or not MIN_ACCEL_PER_HZ <= parsed <= MAX_ACCEL_PER_HZ:
-        raise ValueError("ACCEL_PER_HZ must be between 20 and 150 mm/s^2/Hz")
+        raise ValueError("ACCEL_PER_HZ must be between 20 and 350 mm/s^2/Hz")
     return parsed
 
 
@@ -84,7 +84,7 @@ def check_motion_budget(
     if not MIN_ACCEL_PER_HZ <= effective <= MAX_ACCEL_PER_HZ:
         raise RuntimeError(
             "effective [resonance_tester] accel_per_hz must be between "
-            "20 and 150 mm/s^2/Hz"
+            "20 and 350 mm/s^2/Hz"
         )
     if max_frequency <= 0.0 or motion_limit <= 0.0 or sweep < 0.0:
         raise RuntimeError("resonance excitation limits must be positive")

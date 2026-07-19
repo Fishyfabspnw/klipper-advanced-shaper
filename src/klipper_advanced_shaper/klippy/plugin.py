@@ -181,13 +181,17 @@ class AdvancedInputShaper:
         if experimental_mode and not fast_validation_enabled and repeats < 3:
             raise ValueError("%s requires at least three repeats" % profile)
 
+        training_repeats = 1 if fast_validation_enabled else repeats
+        reference_repeats = repeats if validate else 0
+        candidate_repeats = repeats if validate else 0
+
         attempt_id = self.id_factory()
         self.machine.begin()
         self.current_attempt_id = attempt_id
         self.current_attempt_status = "running"
         self.current_attempt_artifacts = None
         if fast_validation_enabled:
-            protocol_mode = "fast_lower_confidence_2_repeat"
+            protocol_mode = "fast_lower_confidence_1_train_2_held_out"
         elif experimental_mode:
             protocol_mode = "full_confidence_default"
         elif validate:
@@ -199,9 +203,19 @@ class AdvancedInputShaper:
             "lower_confidence": fast_validation_enabled or (validate and repeats < 3),
             "repeats_per_group": repeats,
             "validation_enabled": bool(validate),
-            "full_sweeps_per_axis": repeats * (3 if validate else 1),
+            "full_sweeps_per_axis": (
+                training_repeats + reference_repeats + candidate_repeats
+            ),
             "motion_time_excludes_host_analysis_and_artifact_time": True,
         }
+        if fast_validation_enabled:
+            validation_protocol.update(
+                {
+                    "training_repeats": training_repeats,
+                    "reference_repeats": reference_repeats,
+                    "candidate_repeats": candidate_repeats,
+                }
+            )
         if peak_lock_enabled:
             validation_protocol.update(
                 {
@@ -272,7 +286,7 @@ class AdvancedInputShaper:
                 executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             self.machine.transition(CalibrationState.BASELINE_CAPTURE)
             for axis in normalized_axes:
-                for repeat in range(repeats):
+                for repeat in range(training_repeats):
                     self.machine.checkpoint()
                     captures[axis].append(
                         self.adapter.capture(
@@ -350,7 +364,7 @@ class AdvancedInputShaper:
                 self.adapter.apply_temporary(reference)
                 held_out: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
                 for axis in normalized_axes:
-                    for repeat in range(repeats):
+                    for repeat in range(reference_repeats):
                         self.machine.checkpoint()
                         held_out[axis].append(
                             self.adapter.capture(
@@ -364,7 +378,7 @@ class AdvancedInputShaper:
                 self.adapter.apply_temporary(selections)
                 validation: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
                 for axis in normalized_axes:
-                    for repeat in range(repeats):
+                    for repeat in range(candidate_repeats):
                         self.machine.checkpoint()
                         validation[axis].append(
                             self.adapter.capture(

@@ -22,8 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
         ("20.125", 20.125),
         ("45.5", 45.5),
         (60, 60.0),
-        ("149.999", 149.999),
-        (150, 150.0),
+        ("349.999", 349.999),
+        (350, 350.0),
     ],
 )
 def test_accel_per_hz_parser_accepts_config_or_bounded_decimals(value, expected):
@@ -45,7 +45,7 @@ def test_accel_per_hz_parser_accepts_config_or_bounded_decimals(value, expected)
         "inf",
         "30,45",
         "19.999",
-        "150.001",
+        "350.001",
         "HIGH_INTENSITY",
     ],
 )
@@ -102,7 +102,7 @@ def test_motion_budget_includes_sweeping_accel_and_eighty_percent_margin():
 def test_motion_budget_rejects_bounded_value_that_exceeds_printer_limit():
     with pytest.raises(RuntimeError, match="80% motion budget"):
         check_motion_budget(
-            accel_per_hz=150.0,
+            accel_per_hz=350.0,
             max_frequency_hz=135.0,
             printer_max_accel=20_000.0,
             sweeping_accel=400.0,
@@ -111,7 +111,7 @@ def test_motion_budget_rejects_bounded_value_that_exceeds_printer_limit():
 
 def test_configured_effective_value_is_also_range_checked():
     with pytest.raises(RuntimeError, match=r"effective \[resonance_tester\]"):
-        check_motion_budget(151.0, 100.0, 50_000.0)
+        check_motion_budget(351.0, 100.0, 50_000.0)
 
 
 def test_capture_command_overrides_only_explicit_recipe_parameters():
@@ -147,6 +147,7 @@ def test_direct_numeric_calibration_is_the_only_mainsail_visible_macro():
     assert "params.PEAK_LOCK|default(0)" in macros
     assert "PEAK_LOCK={peak_lock}" in macros
     assert "REPEATS=2 VALIDATE=1 HZ_PER_SEC=2" in macros
+    assert "CONFIG or 20..350" in macros
     for explanation in (
         "AXIS chooses X, Y, or ALL",
         "PROFILE chooses the selection tradeoff",
@@ -154,7 +155,7 @@ def test_direct_numeric_calibration_is_the_only_mainsail_visible_macro():
         "VALIDATE enables held-out comparison",
         "ACCEL_PER_HZ sets excitation intensity",
         "HZ_PER_SEC sets sweep speed",
-        "FAST_VALIDATION=1 selects the shorter lower-confidence protocol",
+        "FAST_VALIDATION=1 runs one training, two reference, and two candidate sweeps",
         "PEAK_LOCK=1 fixes generalized MZV frequency",
     ):
         assert explanation in macros

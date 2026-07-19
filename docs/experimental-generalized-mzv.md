@@ -54,9 +54,10 @@ normal calibration pipeline promotes those candidates only under
 `PROFILE=experimental_mzv` or `PROFILE=adaptive_stock` when
 `enable_experimental_generalized_mzv: True`. Its full-confidence default
 requires three or more fitting/reference/candidate repeats. An explicit
-lower-confidence fast protocol permits exactly two of each only with
-`FAST_VALIDATION=1`, `VALIDATE=1`, and `HZ_PER_SEC=2`; one repeat is never
-allowed. Both protocols require measured modal damping, per-capture QC, a 95%
+lower-confidence fast protocol uses one training sweep plus exactly two
+held-out reference and two candidate sweeps only with `FAST_VALIDATION=1`,
+`VALIDATE=1`, and `HZ_PER_SEC=2`; a held-out group is never reduced to one.
+Both protocols require measured modal damping, per-capture QC, a 95%
 attenuation confidence lower bound of at least 10%, no more than 5% cross-axis
 regression, exact runtime readback, and successful rollback. A rejection is
 never applyable or stageable.

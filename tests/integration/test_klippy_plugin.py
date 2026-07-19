@@ -204,7 +204,7 @@ def test_inherited_acceleration_does_not_override_resonance_tester_default():
     assert capture[4] is None
 
 
-def test_bounded_numeric_150_propagates_to_both_axes():
+def test_bounded_numeric_350_propagates_to_both_axes():
     adapter = FakeAdapter()
     plugin = AdvancedInputShaper(adapter=adapter, analyzer=analyzer)
 
@@ -212,11 +212,11 @@ def test_bounded_numeric_150_propagates_to_both_axes():
         ("X", "Y"),
         repeats=1,
         validate=False,
-        accel_per_hz="150",
+        accel_per_hz="350",
     )
 
     captures = [call for call in adapter.calls if call[0] == "capture"]
-    assert [(call[1], call[4]) for call in captures] == [("X", 150.0), ("Y", 150.0)]
+    assert [(call[1], call[4]) for call in captures] == [("X", 350.0), ("Y", 350.0)]
     assert not [call for call in adapter.calls if call[0] == "stage"]
     assert adapter.calls[-1] == ("restore", SNAPSHOT)
 
@@ -233,11 +233,11 @@ def test_dynamic_excitation_rejection_happens_before_snapshot_or_capture():
     plugin = AdvancedInputShaper(adapter=adapter, analyzer=analyzer)
 
     with pytest.raises(RuntimeError, match="80% motion budget"):
-        plugin.calibrate(("X", "Y"), repeats=1, validate=False, accel_per_hz="150")
+        plugin.calibrate(("X", "Y"), repeats=1, validate=False, accel_per_hz="350")
 
     assert adapter.calls == [
         ("preflight", ("X", "Y")),
-        ("excitation_preflight", ("X", "Y"), 150.0, None),
+        ("excitation_preflight", ("X", "Y"), 350.0, None),
     ]
 
 
@@ -269,7 +269,7 @@ def test_numeric_sweep_rate_propagates_to_training_reference_and_candidate_sweep
 
 @pytest.mark.parametrize(
     "value",
-    ["19.999", "150.001", "nan", "1e2", "+30", "30 junk", -1],
+    ["19.999", "350.001", "nan", "1e2", "+30", "30 junk", -1],
 )
 def test_invalid_acceleration_fails_before_preflight_or_motion(value):
     adapter = FakeAdapter()
@@ -713,7 +713,7 @@ def test_adaptive_stock_is_opt_in_and_never_allows_unvalidated_motion():
     assert adapter.calls == []
 
 
-def test_experimental_fast_validation_is_explicit_lower_confidence_and_six_sweeps():
+def test_experimental_fast_validation_keeps_two_held_out_pairs_in_five_sweeps():
     adapter = ExperimentalAdapter()
     plugin = AdvancedInputShaper(
         adapter=adapter,
@@ -732,13 +732,18 @@ def test_experimental_fast_validation_is_explicit_lower_confidence_and_six_sweep
     )
 
     captures = [call for call in adapter.calls if call[0] == "capture"]
-    assert len(captures) == 6
+    assert len(captures) == 5
+    assert sum(not call[3] for call in captures) == 1
+    assert sum(call[3] for call in captures) == 4
     assert {call[5] for call in captures} == {2.0}
     protocol = result.report["validation_protocol"]
-    assert protocol["mode"] == "fast_lower_confidence_2_repeat"
+    assert protocol["mode"] == "fast_lower_confidence_1_train_2_held_out"
     assert protocol["lower_confidence"] is True
     assert protocol["repeats_per_group"] == 2
-    assert protocol["full_sweeps_per_axis"] == 6
+    assert protocol["training_repeats"] == 1
+    assert protocol["reference_repeats"] == 2
+    assert protocol["candidate_repeats"] == 2
+    assert protocol["full_sweeps_per_axis"] == 5
     assert plugin.status()["validation_protocol"] == protocol
 
 

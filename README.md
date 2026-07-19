@@ -107,7 +107,7 @@ does not load Klippy, read accelerometer data, or issue G-code.
 ## Commands
 
 ```text
-ADV_SHAPER_CALIBRATE AXIS=X|Y|ALL PROFILE=quality|balanced|performance|experimental_mzv|adaptive_stock REPEATS=3 VALIDATE=1 ACCEL_PER_HZ=CONFIG|20..150 HZ_PER_SEC=CONFIG|0.1..2 FAST_VALIDATION=0|1 PEAK_LOCK=0|1
+ADV_SHAPER_CALIBRATE AXIS=X|Y|ALL PROFILE=quality|balanced|performance|experimental_mzv|adaptive_stock REPEATS=3 VALIDATE=1 ACCEL_PER_HZ=CONFIG|20..350 HZ_PER_SEC=CONFIG|0.1..2 FAST_VALIDATION=0|1 PEAK_LOCK=0|1
 ADV_SHAPER_STATUS
 ADV_SHAPER_CANCEL
 ADV_SHAPER_APPLY RESULT=<id>
@@ -123,11 +123,11 @@ calibration parameters:
 | --- | --- | --- | --- |
 | `AXIS` | `X`, `Y`, or `ALL` | `ALL` | Calibrates one axis or X followed by Y. Every requested axis must be homed. |
 | `PROFILE` | `quality`, `balanced`, `performance`, `experimental_mzv`, or `adaptive_stock` | `balanced` | The first three retain the ordinary native analysis path. `experimental_mzv` searches only generalized MZV. `adaptive_stock` compares all six native families with generalized MZV. The last two require the explicit config opt-in and mandatory held-out validation. |
-| `REPEATS` | Integer `1` through `20` | `3` | Sweeps per training/reference/candidate group. Experimental profiles require at least three, except the exact two-repeat fast protocol. |
+| `REPEATS` | Integer `1` through `20` | `3` | Sweeps per group. Experimental profiles require at least three. Fast validation uses this required value of two for each held-out group and intentionally uses one training sweep. |
 | `VALIDATE` | `0` or `1` | `1` | Runs independent reference and candidate sweeps when `1`. It is mandatory for both experimental profiles. A `0` run is not physical performance evidence. |
-| `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal from `20` through `150` | `CONFIG` | Free numeric excitation control in mm/s^2/Hz—not presets. `CONFIG` inherits `[resonance_tester]`. The resolved value must pass the dynamic motion-budget check. |
+| `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal from `20` through `350` | `CONFIG` | Free numeric excitation control in mm/s^2/Hz—not presets. `CONFIG` inherits `[resonance_tester]`. The resolved value must pass the dynamic motion-budget check. |
 | `HZ_PER_SEC` | `CONFIG` or any unsigned decimal from `0.1` through `2` | `CONFIG` | Sweep rate in Hz/s. It changes commanded sweep time, not excitation intensity. |
-| `FAST_VALIDATION` | `0` or `1` | `0` | Lower-confidence mode for the two experimental profiles only. `1` requires exactly `REPEATS=2`, `VALIDATE=1`, and explicit `HZ_PER_SEC=2`. |
+| `FAST_VALIDATION` | `0` or `1` | `0` | Lower-confidence mode for the two experimental profiles only. `1` requires exactly `REPEATS=2`, `VALIDATE=1`, and explicit `HZ_PER_SEC=2`; it runs one training, two reference, and two candidate sweeps. |
 | `PEAK_LOCK` | `0` or `1` | `0` | Experimental profiles only. `1` fixes generalized-MZV frequency to the strongest measured PSD mode for that axis; it does not weaken any validation gate. |
 
 Run calibration only while the printer is idle, clear of obstructions, and
@@ -139,7 +139,7 @@ ADV_SHAPER_CALIBRATE AXIS=X PROFILE=balanced REPEATS=3 VALIDATE=1
 ```
 
 `ADV_SHAPER_UI_CALIBRATE` is the only macro shown in Mainsail's macro panel.
-Enter `ACCEL_PER_HZ` as any number from 20 through 150, or enter `CONFIG`; the
+Enter `ACCEL_PER_HZ` as any number from 20 through 350, or enter `CONFIG`; the
 macro deliberately does not force a list of presets. Mainsail's standard macro
 UI cannot attach a separate tooltip to each input. The macro description, its
 start message, and the table above provide the parameter explanations. The
@@ -152,14 +152,14 @@ Klippy's low-level `ADV_SHAPER_STATUS`, `ADV_SHAPER_CANCEL`,
 The same free numeric control is available from the console, for example:
 
 ```text
-ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=150 HZ_PER_SEC=2 FAST_VALIDATION=1
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=350 HZ_PER_SEC=2 FAST_VALIDATION=1
 ```
 
-`ACCEL_PER_HZ` accepts `CONFIG` or an unsigned decimal from 20 through 150
+`ACCEL_PER_HZ` accepts `CONFIG` or an unsigned decimal from 20 through 350
 mm/s^2/Hz inclusive. `CONFIG` inherits `[resonance_tester]` without overriding
 it. Signs, exponent notation, leading-zero ambiguity, whitespace, non-finite
 values, junk, and out-of-range numbers are rejected before preflight. The
-effective inherited value must also be within 20..150.
+effective inherited value must also be within 20..350.
 
 `HZ_PER_SEC` independently accepts `CONFIG` or an unsigned decimal from 0.1
 through 2 Hz/s inclusive, matching the installed upstream Klipper limit.
@@ -179,7 +179,7 @@ machinery, and be ready to use `M112`.
 Increasing `ACCEL_PER_HZ` may raise measured accelerometer response and PSD, but
 it does not directly set the graph scale and does not guarantee a PSD above
 `1e-5`. Excessive excitation can instead cause sensor clipping, skipped steps,
-or hardware damage. A numeric value of 150 is accepted only when the dynamic
+or hardware damage. A numeric value of 350 is accepted only when the dynamic
 motion-budget preflight also passes.
 
 The hidden UI apply and stage wrappers default to the current accepted result
@@ -229,18 +229,19 @@ ADV_SHAPER_CALIBRATE AXIS=X PROFILE=experimental_mzv REPEATS=2 VALIDATE=1 ACCEL_
 The same bounded protocol can run the cross-family stock-compatible search:
 
 ```text
-ADV_SHAPER_CALIBRATE AXIS=ALL PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=150 HZ_PER_SEC=2 FAST_VALIDATION=1 PEAK_LOCK=1
+ADV_SHAPER_CALIBRATE AXIS=ALL PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=350 HZ_PER_SEC=2 FAST_VALIDATION=1 PEAK_LOCK=1
 ```
 
-This performs two training, two held-out reference, and two candidate sweeps.
-For a 5–135 Hz range, the six commanded sweeps are approximately 6.5 minutes of
+This performs one training, two held-out reference, and two candidate sweeps.
+For a 5–135 Hz range, the five commanded sweeps are approximately 5.4 minutes of
 resonance motion per axis at 2 Hz/s. This is not a promise that the complete
-axis workflow finishes within 6.5 or 7 minutes: movement between probe points,
+axis workflow finishes within 5.4 or 7 minutes: movement between probe points,
 sensor setup, status checks, host analysis, report rendering, and artifact I/O
 add elapsed time. The faster rate and two-repeat confidence interval trade
 spectral and statistical confidence for time; all QC, 95% attenuation CI,
 cross-axis regression, exact readback, and rollback gates remain fail-closed.
-`FAST_VALIDATION=1` accepts neither one nor three repeats, requires explicit
+`FAST_VALIDATION=1` never reduces either held-out group below two captures,
+accepts neither one nor three for `REPEATS`, requires explicit
 `HZ_PER_SEC=2`, and never makes a rejected result eligible for apply or stage.
 The default experimental path remains at least three repeats.
 

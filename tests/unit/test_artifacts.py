@@ -218,20 +218,23 @@ def test_rejected_report_leads_with_failure_and_cannot_imply_applicability(tmp_p
 def test_fast_validation_is_visibly_labeled_with_motion_only_timing(tmp_path):
     report = _complete_report()
     report["validation_protocol"] = {
-        "mode": "fast_lower_confidence_2_repeat",
+        "mode": "fast_lower_confidence_1_train_2_held_out",
         "lower_confidence": True,
         "repeats_per_group": 2,
-        "full_sweeps_per_axis": 6,
+        "training_repeats": 1,
+        "reference_repeats": 2,
+        "candidate_repeats": 2,
+        "full_sweeps_per_axis": 5,
         "hz_per_sec": 2.0,
-        "estimated_motion_seconds_per_axis": 390.0,
+        "estimated_motion_seconds_per_axis": 325.0,
         "motion_time_excludes_host_analysis_and_artifact_time": True,
     }
     ArtifactWriter(tmp_path, keep_raw=False).write("fast", report)
     rendered = (tmp_path / "fast" / "report.html").read_text(encoding="utf-8")
 
     assert "Lower-confidence fast validation" in rendered
-    assert "2 repeats/group" in rendered
-    assert "6.5 min estimated motion/axis" in rendered
+    assert "1 train + 2 reference + 2 candidate" in rendered
+    assert "5.4 min estimated motion/axis" in rendered
     assert "motion estimate excludes host analysis and artifact time" in rendered
 
 

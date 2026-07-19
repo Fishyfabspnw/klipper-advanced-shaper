@@ -92,11 +92,12 @@ def test_readme_documents_sweep_timing_and_smoke_test_boundaries():
     assert "ACCEL_PER_HZ` changes excitation intensity, not sweep duration" in normalized
     assert "REPEATS=1 VALIDATE=0" in normalized
     assert "full-confidence default requires `REPEATS>=3`" in normalized
-    assert "approximately 6.5 minutes of resonance motion per axis at 2 Hz/s" in normalized
+    assert "approximately 5.4 minutes of resonance motion per axis at 2 Hz/s" in normalized
+    assert "five commanded sweeps" in normalized
     assert "movement between probe points" in normalized
     assert "not a promise that the complete axis workflow finishes" in normalized
     assert "attempt `9a822d6fdc4b` completed all 18 sweeps" in normalized
-    assert "unsigned decimal from 20 through 150" in normalized
+    assert "unsigned decimal from 20 through 350" in normalized
     assert "does not require Klipper's optional `[respond]` section" in normalized
     assert "fit within 80% of the printer's current" in normalized
     assert "does not guarantee a PSD above `1e-5`" in normalized

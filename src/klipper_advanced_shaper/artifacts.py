@@ -866,7 +866,8 @@ class ArtifactWriter:
         protocol = report.get("validation_protocol", {})
         protocol = protocol if isinstance(protocol, Mapping) else {}
         if protocol:
-            if protocol.get("mode") == "fast_lower_confidence_2_repeat":
+            mode = str(protocol.get("mode", ""))
+            if mode.startswith("fast_lower_confidence"):
                 protocol_label = "Lower-confidence fast validation"
             elif protocol.get("lower_confidence"):
                 protocol_label = "Lower-confidence validation"
@@ -874,8 +875,18 @@ class ArtifactWriter:
                 protocol_label = "Full-confidence validation"
             motion_seconds = _finite(protocol.get("estimated_motion_seconds_per_axis"))
             motion_minutes = motion_seconds / 60.0 if motion_seconds is not None else None
+            if mode.startswith("fast_lower_confidence"):
+                repeat_summary = (
+                    f'{_escape(protocol.get("training_repeats", "-"))} train + '
+                    f'{_escape(protocol.get("reference_repeats", "-"))} reference + '
+                    f'{_escape(protocol.get("candidate_repeats", "-"))} candidate'
+                )
+            else:
+                repeat_summary = (
+                    f'{_escape(protocol.get("repeats_per_group", "-"))} repeats/group'
+                )
             cards.append(
-                f'''<article class="metric"><span>Validation protocol</span><strong>{_escape(protocol_label)}</strong><small>{_escape(protocol.get("repeats_per_group", "-"))} repeats/group | {_number(motion_minutes, 1)} min estimated motion/axis</small></article>'''
+                f'''<article class="metric"><span>Validation protocol</span><strong>{_escape(protocol_label)}</strong><small>{repeat_summary} | {_number(motion_minutes, 1)} min estimated motion/axis</small></article>'''
             )
             findings.append(
                 f"Validation protocol: <strong>{_escape(protocol_label)}</strong>; "

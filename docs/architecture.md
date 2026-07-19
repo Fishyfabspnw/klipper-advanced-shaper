@@ -49,7 +49,7 @@ not import Klipper.
 
 An omitted calibration `ACCEL_PER_HZ` remains omitted at that boundary, so
 Klipper inherits the active `[resonance_tester]` value. An explicit value is
-strictly parsed as an unsigned decimal from 20 through 150 mm/s^2/Hz. Signs,
+strictly parsed as an unsigned decimal from 20 through 350 mm/s^2/Hz. Signs,
 exponents, whitespace, non-finite values, and trailing text fail closed. The
 effective inherited value is subject to the same bounds.
 
