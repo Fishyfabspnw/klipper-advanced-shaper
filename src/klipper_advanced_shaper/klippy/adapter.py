@@ -77,7 +77,9 @@ class PrinterAdapter(Protocol):
         hz_per_sec: Optional[float],
     ) -> Mapping[str, Any]: ...
     def preflight_experimental(
-        self, selections: Sequence[ShaperSelection] = ()
+        self,
+        selections: Sequence[ShaperSelection] = (),
+        max_vibrations: Optional[float] = None,
     ) -> Mapping[str, Any]: ...
     def snapshot(self) -> PrinterSnapshot: ...
     def capture(
@@ -87,6 +89,7 @@ class PrinterAdapter(Protocol):
         validation: bool = False,
         accel_per_hz: Optional[float] = None,
         hz_per_sec: Optional[float] = None,
+        max_vibrations: Optional[float] = None,
     ) -> Any: ...
     def apply_temporary(self, selections: Sequence[ShaperSelection]) -> None: ...
     def set_test_square_corner_velocity(self, value: float) -> None: ...
@@ -160,7 +163,9 @@ class KlipperPrinterAdapter:
         return limit
 
     def preflight_experimental(
-        self, selections: Sequence[ShaperSelection] = ()
+        self,
+        selections: Sequence[ShaperSelection] = (),
+        max_vibrations: Optional[float] = None,
     ) -> Mapping[str, Any]:
         from klipper_advanced_shaper.analysis.experimental import (
             prove_runtime_generalized_mzv,
@@ -202,6 +207,19 @@ class KlipperPrinterAdapter:
                 "installed Klipper does not safely support generalized MZV: %s"
                 % failed.get("reason", "capability proof failed")
             )
+        if max_vibrations is not None:
+            if self.capture_provider is None:
+                self.capture_provider = self.printer.lookup_object(
+                    "advanced_shaper_capture", None
+                )
+            fitting_probe = getattr(
+                self.capture_provider, "preflight_native_fitting", None
+            )
+            if fitting_probe is None:
+                raise RuntimeError(
+                    "capture provider cannot prove max_vibrations fitting support"
+                )
+            proof["native_fitting"] = fitting_probe(max_vibrations)
         proof["selection_proofs"] = [
             self._prove_selection(selection)
             for selection in selections
@@ -304,6 +322,7 @@ class KlipperPrinterAdapter:
         validation: bool = False,
         accel_per_hz: Optional[float] = None,
         hz_per_sec: Optional[float] = None,
+        max_vibrations: Optional[float] = None,
     ) -> Any:
         shaping = self._shaping_status()
         damping_key = "damping_ratio_" + axis.lower()
@@ -325,6 +344,7 @@ class KlipperPrinterAdapter:
             hz_per_sec=hz_per_sec,
             design_damping_ratio=design_damping_ratio,
             native_shapers=self._capture_native_shapers,
+            max_vibrations=max_vibrations,
         )
 
     def _shaping_status(self, eventtime: Optional[float] = None) -> dict[str, Any]:

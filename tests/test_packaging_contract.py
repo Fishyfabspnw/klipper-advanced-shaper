@@ -97,7 +97,8 @@ def test_readme_documents_sweep_timing_and_smoke_test_boundaries():
     assert "five commanded sweeps" in normalized
     assert "movement between probe points" in normalized
     assert "not a promise that the complete axis workflow finishes" in normalized
-    assert "attempt `9a822d6fdc4b` completed all 18 sweeps" in normalized
+    assert "Validation-rejected attempts retain diagnostic artifacts" in normalized
+    assert "never become eligible for apply or stage" in normalized
     assert "unsigned decimal from 20 through 350" in normalized
     assert "does not require Klipper's optional `[respond]` section" in normalized
     assert "fit within 80% of the printer's current" in normalized

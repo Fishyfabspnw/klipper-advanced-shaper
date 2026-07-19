@@ -47,6 +47,17 @@ refuses to run when the expected interface changes. All access to this private
 surface is isolated in `klippy/capture.py`; the numerical engine and reports do
 not import Klipper.
 
+For `experimental_mzv` and `adaptive_stock` only, preflight also proves that
+the installed native fitter explicitly accepts `max_vibrations`. The plugin
+passes the finite fraction from that profile's `maximum_residual` (currently
+`0.10`, or 10%, for both) to upstream fitting. This changes the frequency that
+upstream fits within each native family before project-side ranking; it is not
+the held-out requirement to demonstrate a 10% attenuation improvement. The
+value is never normalized when absent: ordinary profiles omit the argument and
+therefore retain their legacy fitting behavior. If an experimental profile
+requires it and the installed fitter cannot prove support, preflight abstains
+before snapshot or motion.
+
 An omitted calibration `ACCEL_PER_HZ` remains omitted at that boundary, so
 Klipper inherits the active `[resonance_tester]` value. An explicit value is
 strictly parsed as an unsigned decimal from 20 through 350 mm/s^2/Hz. Signs,
@@ -78,14 +89,19 @@ the resolved rate, its source, sweep count, and estimated physical sweep time.
 The estimate explicitly excludes host analysis and artifact generation.
 
 The default experimental validation protocol requires at least three training,
-three held-out reference, and three candidate repeats. The explicit fast mode
-is the sole exception: exactly two repeats per group, `VALIDATE=1`, and explicit
+three held-out reference, and three candidate repeats. Held-out captures are
+executed as readback-verified, within-axis A/B pairs: the exact snapshot shaper
+is applied and captured, then the exact candidate is applied and captured for
+the same pair ID before advancing. Reports retain the ordered capture ledger and
+pair IDs, and the paired bootstrap consumes the two lists in that order. The
+explicit fast mode is the sole exception: exactly two repeats per group,
+`VALIDATE=1`, and explicit
 `HZ_PER_SEC=2`. It remains a held-out 95% attenuation-confidence test with QC,
 cross-axis regression, exact readback, and rollback gates, but reports label it
 as lower confidence. One-repeat experimental validation remains forbidden.
 
 An optional `PEAK_LOCK=1` request is carried through the controller and analysis
-boundary only for the two adaptive stock profiles. Analysis selects the highest-PSD
+boundary only for the two experimental profiles. Analysis selects the highest-PSD
 detected mode independently for each axis and restricts the generalized-MZV
 frequency search to that one exact bin. This changes candidate generation, not
 the validation or restoration protocol.
@@ -96,6 +112,21 @@ shapers, so acceptance compares the proposal against the shaper active when the
 session began. A candidate is never published when capture, analysis, artifact writing, or state
 restoration fails.
 
+For `adaptive_stock`, training-time cross-axis ranking is candidate-specific.
+Native candidates weight the measured cross-axis PSD by their exact upstream
+frequency-response curves. Generalized MZV candidates use the same measured PSD
+with `oscillator_response` and report a conservative 95th-percentile residual
+over measured damping uncertainty. This modeled ranking signal never substitutes
+for the mandatory measured held-out cross-axis non-regression gate.
+
+The exact snapshot shaper is always the held-out A/reference condition, but it
+is not synthesized into the training candidate pool when Klipper's optimizer
+does not return that exact type-and-frequency tuple. Treating an optimized
+same-family row as the snapshot would be false parity. A future no-change
+candidate requires the capture bridge to obtain an exact-frequency score and
+response from the installed Klipper version; until then, rejection safely keeps
+the snapshot and no report claims that it was directly ranked.
+
 Parameterized identifiers pass through one strict parser shared by analysis and
 Klippy. Temporary application reads status back per axis before motion resumes;
 rollback uses and verifies the same canonical snapshot. Unsupported installed
@@ -103,6 +134,11 @@ Klipper builds abstain instead of substituting native MZV. The capability record
 includes the executor pulse capacity discovered from the installed Klipper
 source; optimization never emits a candidate above that capacity or the
 project-wide ten-pulse limit.
+
+The parser and capability foundation intentionally reserve allowlisted
+parameter extensions for later work. In particular, upstream-style
+`ei(v_tol=...)` is not runtime-exposed in this release; it cannot be passed as
+an arbitrary shaper argument.
 
 ## Stock-compatible adaptive boundary
 

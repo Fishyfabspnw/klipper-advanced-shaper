@@ -4,6 +4,9 @@ import numpy as np
 import pytest
 
 from klipper_advanced_shaper.analysis import analyze_calibration
+from klipper_advanced_shaper.analysis.facade import _candidate_scores
+from klipper_advanced_shaper.analysis.models import Spectrum
+from klipper_advanced_shaper.analysis.selection import PROFILES, select_candidate
 
 
 def _capture(axis="X", scale=1.0, repeat=0, cross_scale=0.0, display_data=True):
@@ -141,6 +144,7 @@ def test_facade_requires_statistically_lower_held_out_energy():
         profile="performance",
         snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
         prior_report=first,
+        validation_pair_ids={"X": ["X-01", "X-02", "X-03"]},
     )
     assert result["validation"]["passed"]
     assert result["validation"]["axes"]["X"]["improvement_ci_95"][0] > 0.10
@@ -164,6 +168,7 @@ def test_facade_fast_two_repeat_validation_keeps_ci_qc_and_cross_axis_gates():
         profile="performance",
         snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
         prior_report=first,
+        validation_pair_ids={"X": ["X-01", "X-02"]},
     )
 
     evidence = result["validation"]["axes"]["X"]
@@ -173,6 +178,24 @@ def test_facade_fast_two_repeat_validation_keeps_ci_qc_and_cross_axis_gates():
     assert len(evidence["candidate_qc"]) == 2
     assert evidence["improvement_ci_95"][0] > 0.10
     assert evidence["cross_axis_regression"] <= 0.05
+    assert evidence["pair_ids"] == ["X-01", "X-02"]
+    assert evidence["pair_count"] == 2
+    assert evidence["capture_design"] == "paired_interleaved_ab"
+    assert evidence["energy_units"] == "acceleration_squared"
+    assert len(evidence["reference_energy_samples"]) == 2
+    assert len(evidence["candidate_energy_samples"]) == 2
+    assert len(evidence["paired_energy_observations"]) == 2
+    assert evidence["paired_energy_observations"][0]["pair_id"] == "X-01"
+    assert all(
+        np.isfinite(row[key])
+        for row in evidence["paired_energy_observations"]
+        for key in (
+            "reference_energy",
+            "candidate_energy",
+            "reference_cross_axis_energy",
+            "candidate_cross_axis_energy",
+        )
+    )
 
 
 def test_facade_rejects_cross_axis_regression_even_with_main_axis_improvement():
@@ -260,6 +283,15 @@ def test_adaptive_stock_compares_native_and_parameterized_stock_candidates():
     candidates = report["axes"]["X"]["candidates"]
     assert any(not item["metadata"].get("parameterized") for item in candidates)
     assert any(item["metadata"].get("parameterized") for item in candidates)
+    assert all(
+        item["metadata"]["cross_axis_metric"].startswith("predicted_cross_axis")
+        for item in candidates
+    )
+    assert {
+        item["metadata"]["cross_axis_model"]
+        for item in candidates
+        if item["metadata"].get("parameterized")
+    } == {"oscillator_response_weighted_training_cross_psd"}
     assert {
         item["metadata"]["design_damping_ratio"]
         for item in candidates
@@ -276,6 +308,47 @@ def test_adaptive_stock_compares_native_and_parameterized_stock_candidates():
         "held_out_validation_required": True,
     }
     assert report["native_command_preview"].startswith("SET_INPUT_SHAPER ")
+
+
+def test_candidate_specific_cross_axis_response_can_change_selection():
+    frequencies = np.asarray([5.0, 74.0, 111.0, 150.0])
+    along = Spectrum(frequencies, np.asarray([0.0, 10.0, 0.0, 0.0]), 1000.0, 8)
+    cross = Spectrum(frequencies, np.asarray([0.0, 0.0, 10.0, 0.0]), 1000.0, 8)
+    base = {
+        "frequency": 74.0,
+        "residual_vibration": 0.04,
+        "smoothing": 0.1,
+        "max_accel": 10000.0,
+        "design_damping_ratio": 0.08,
+    }
+    capture = {
+        "native_candidates": [
+            {
+                **base,
+                "name": "mzv",
+                "native_frequency_response": {
+                    "frequency_hz": frequencies.tolist(),
+                    "response_ratio": [1.0, 0.05, 0.01, 1.0],
+                },
+            },
+            {
+                **base,
+                "name": "zv",
+                "native_frequency_response": {
+                    "frequency_hz": frequencies.tolist(),
+                    "response_ratio": [1.0, 0.05, 0.90, 1.0],
+                },
+            },
+        ]
+    }
+
+    shared = _candidate_scores([capture], 0.01, 0.2)
+    modeled = _candidate_scores([capture], 0.01, 0.2, along, cross)
+
+    assert select_candidate(shared, PROFILES["adaptive_stock"]).selected.name == "zv"
+    assert select_candidate(modeled, PROFILES["adaptive_stock"]).selected.name == "mzv"
+    modeled_by_name = {item.name: item for item in modeled}
+    assert modeled_by_name["mzv"].cross_axis_energy < modeled_by_name["zv"].cross_axis_energy
 
 
 def test_experimental_optimizer_respects_installed_executor_pulse_limit():

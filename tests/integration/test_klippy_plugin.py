@@ -64,9 +64,18 @@ class FakeAdapter:
         validation=False,
         accel_per_hz=None,
         hz_per_sec=None,
+        max_vibrations=None,
     ):
         self.calls.append(
-            ("capture", axis, repeat, validation, accel_per_hz, hz_per_sec)
+            (
+                "capture",
+                axis,
+                repeat,
+                validation,
+                accel_per_hz,
+                hz_per_sec,
+                max_vibrations,
+            )
         )
         capture_count = sum(call[0] == "capture" for call in self.calls)
         if capture_count == self.fail_capture_at:
@@ -170,9 +179,42 @@ def test_calibration_validates_held_out_data_and_always_restores():
     shaped_comparisons = [c for c in adapter.calls if c[0] == "capture" and c[3]]
     assert len(training) == 3
     assert len(shaped_comparisons) == 6
-    assert len([c for c in adapter.calls if c[0] == "apply"]) == 2
+    assert {call[6] for call in adapter.calls if call[0] == "capture"} == {None}
+    validation_actions = [
+        call for call in adapter.calls if call[0] in {"apply", "capture"}
+    ][3:]
+    assert [call[0] for call in validation_actions] == [
+        "apply", "capture", "apply", "capture",
+        "apply", "capture", "apply", "capture",
+        "apply", "capture", "apply", "capture",
+    ]
+    assert [
+        call[1][0].frequency for call in validation_actions if call[0] == "apply"
+    ] == [50.0, 71.5, 50.0, 71.5, 50.0, 71.5]
+    protocol = result.report["validation_protocol"]
+    assert protocol["capture_design"] == "paired_interleaved_ab"
+    assert protocol["pair_ids_by_axis"] == {"X": ["X-01", "X-02", "X-03"]}
+    assert [row["condition_label"] for row in protocol["capture_order"]] == [
+        "A", "B", "A", "B", "A", "B"
+    ]
     assert adapter.calls[-1] == ("restore", SNAPSHOT)
     assert plugin.status()["state"] == "review"
+
+
+def test_failure_during_interleaved_pair_restores_exact_snapshot():
+    adapter = FakeAdapter(fail_capture_at=4)
+    plugin = AdvancedInputShaper(adapter=adapter, analyzer=analyzer)
+
+    with pytest.raises(RuntimeError, match="accelerometer disconnected"):
+        plugin.calibrate(("X",), repeats=2, validate=True)
+
+    validation_actions = [
+        call for call in adapter.calls if call[0] in {"apply", "capture"}
+    ][2:]
+    assert [call[0] for call in validation_actions] == [
+        "apply", "capture", "apply", "capture"
+    ]
+    assert adapter.calls[-1] == ("restore", SNAPSHOT)
 
 
 def test_bounded_numeric_acceleration_is_used_for_training_and_held_out_validation():
@@ -376,7 +418,9 @@ def test_rejected_validation_is_written_only_after_rollback_with_full_diagnostic
         plugin.apply("rejected-attempt")
     with pytest.raises(ValueError, match="unknown result"):
         plugin.stage("rejected-attempt")
-    assert plugin.status() == {
+    status = dict(plugin.status())
+    protocol = status.pop("validation_protocol")
+    assert status == {
         "state": "failed",
         "result_id": None,
         "attempt_id": "rejected-attempt",
@@ -385,19 +429,13 @@ def test_rejected_validation_is_written_only_after_rollback_with_full_diagnostic
         "cancel_requested": False,
         "error": "candidate failed held-out validation: confidence interval below target",
         "experimental_generalized_mzv_enabled": False,
-        "validation_protocol": {
-            "mode": "native_validation",
-            "lower_confidence": True,
-            "repeats_per_group": 2,
-            "validation_enabled": True,
-                "full_sweeps_per_axis": 6,
-                "motion_time_excludes_host_analysis_and_artifact_time": True,
-                "square_corner_velocity_source": "printer_snapshot",
-                "estimated_motion_seconds_per_axis": 570.0,
-                "hz_per_sec": 1.0,
-                "square_corner_velocity": 5.0,
-            },
     }
+    assert protocol["capture_design"] == "paired_interleaved_ab"
+    assert protocol["pair_ids_by_axis"] == {"X": ["X-01", "X-02"]}
+    assert [row["condition_label"] for row in protocol["capture_order"]] == [
+        "A", "B", "A", "B"
+    ]
+    assert written["report"]["validation_protocol"] == protocol
 
 
 def test_new_rejected_attempt_does_not_expose_stale_accepted_result_id():
@@ -604,6 +642,122 @@ def test_real_adapter_uses_native_shaper_command_and_stage_does_not_save():
     assert all("SAVE_CONFIG" not in script for script in scripts)
 
 
+def test_stale_frequency_readback_blocks_validation_capture_and_restores_snapshot():
+    shaping_status = {
+        "shaper_type_x": SNAPSHOT.shaper_type_x,
+        "shaper_freq_x": SNAPSHOT.shaper_freq_x,
+        "damping_ratio_x": SNAPSHOT.damping_ratio_x,
+        "shaper_type_y": SNAPSHOT.shaper_type_y,
+        "shaper_freq_y": SNAPSHOT.shaper_freq_y,
+        "damping_ratio_y": SNAPSHOT.damping_ratio_y,
+    }
+    velocity_status = {
+        "max_velocity": SNAPSHOT.max_velocity,
+        "max_accel": SNAPSHOT.max_accel,
+        "square_corner_velocity": SNAPSHOT.square_corner_velocity,
+    }
+
+    class Reactor:
+        @staticmethod
+        def monotonic():
+            return 1.0
+
+    class InputShaper:
+        @staticmethod
+        def get_status(_eventtime):
+            return dict(shaping_status)
+
+    class Toolhead:
+        @staticmethod
+        def get_status(_eventtime):
+            return dict(velocity_status)
+
+    class GCode:
+        def __init__(self):
+            self.scripts = []
+
+        def run_script_from_command(self, command):
+            self.scripts.append(command)
+            arguments = dict(
+                token.split("=", 1) for token in command.split()[1:]
+            )
+            if command.startswith("SET_INPUT_SHAPER"):
+                for axis in ("X", "Y"):
+                    suffix = axis.lower()
+                    shaper_type = arguments.get("SHAPER_TYPE_" + axis)
+                    damping = arguments.get("DAMPING_RATIO_" + axis)
+                    if shaper_type is not None:
+                        shaping_status["shaper_type_" + suffix] = shaper_type
+                    if damping is not None:
+                        shaping_status["damping_ratio_" + suffix] = float(damping)
+                    # Reproduce Klipper regression 77d5d94: the command accepts
+                    # type and damping but silently retains the old frequency.
+            elif command.startswith("SET_VELOCITY_LIMIT"):
+                velocity_status["max_velocity"] = float(arguments["VELOCITY"])
+                velocity_status["max_accel"] = float(arguments["ACCEL"])
+                velocity_status["square_corner_velocity"] = float(
+                    arguments["SQUARE_CORNER_VELOCITY"]
+                )
+
+    class Printer:
+        def __init__(self, gcode):
+            self.objects = {
+                "gcode": gcode,
+                "input_shaper": InputShaper(),
+                "toolhead": Toolhead(),
+            }
+
+        @staticmethod
+        def get_reactor():
+            return Reactor()
+
+        def lookup_object(self, name, default=None):
+            return self.objects.get(name, default)
+
+    gcode = GCode()
+    adapter = KlipperPrinterAdapter.__new__(KlipperPrinterAdapter)
+    adapter.gcode = gcode
+    adapter.printer = Printer(gcode)
+    adapter.capture_provider = None
+    adapter._capture_native_shapers = None
+    adapter._prove_selection = lambda _selection: {"passed": True}
+    adapter.preflight = lambda _axes: None
+    adapter.preflight_excitation = lambda _axes, _accel, _rate: {
+        "min_frequency_hz": 5.0,
+        "max_frequency_hz": 100.0,
+        "hz_per_sec": 1.0,
+    }
+    captures = []
+
+    def capture(axis, repeat, validation=False, **_kwargs):
+        captures.append((axis, repeat, validation))
+        return {"axis": axis, "repeat": repeat, "validation": validation}
+
+    adapter.capture = capture
+    plugin = AdvancedInputShaper(adapter=adapter, analyzer=analyzer)
+
+    with pytest.raises(RuntimeError, match="X-axis frequency readback mismatch"):
+        plugin.calibrate(("X",), repeats=1, validate=True)
+
+    # Training and the held-out reference complete, but stale candidate
+    # frequency readback prevents its validation motion from starting.
+    assert captures == [("X", 0, False), ("X", 0, True)]
+    assert shaping_status == {
+        "shaper_type_x": SNAPSHOT.shaper_type_x,
+        "shaper_freq_x": SNAPSHOT.shaper_freq_x,
+        "damping_ratio_x": SNAPSHOT.damping_ratio_x,
+        "shaper_type_y": SNAPSHOT.shaper_type_y,
+        "shaper_freq_y": SNAPSHOT.shaper_freq_y,
+        "damping_ratio_y": SNAPSHOT.damping_ratio_y,
+    }
+    assert velocity_status == {
+        "max_velocity": SNAPSHOT.max_velocity,
+        "max_accel": SNAPSHOT.max_accel,
+        "square_corner_velocity": SNAPSHOT.square_corner_velocity,
+    }
+    assert gcode.scripts[-1].startswith("SET_VELOCITY_LIMIT")
+
+
 def experimental_analyzer(**kwargs):
     if "validation_captures" in kwargs:
         return {
@@ -647,13 +801,19 @@ def experimental_analyzer(**kwargs):
 
 
 class ExperimentalAdapter(FakeAdapter):
-    def preflight_experimental(self, selections=()):
+    def preflight_experimental(self, selections=(), max_vibrations=None):
         self.calls.append(("capability", tuple(selections)))
         return {
             "passed": True,
             "syntax": "mzv(n=4,t=0.800000)",
             "pulse_count": 4,
             "executor_pulse_limit": 10,
+            "native_fitting": {
+                "passed": True,
+                "parameter": "max_vibrations",
+                "fraction": max_vibrations,
+                "percent": max_vibrations * 100.0,
+            },
         }
 
 
@@ -717,6 +877,14 @@ def test_adaptive_stock_native_winner_keeps_capability_and_validation_gates():
     )
     assert result.selections == (ShaperSelection("zvd", 68.0, "X", 0.07),)
     assert result.report["runtime_capability"]["passed"] is True
+    assert result.report["runtime_capability"]["native_fitting"]["fraction"] == 0.10
+    assert result.report["validation_protocol"]["native_fit_max_vibrations"] == {
+        "fraction": 0.10,
+        "percent": 10.0,
+        "source": "selection_profile.maximum_residual",
+        "upstream_parameter": "max_vibrations",
+    }
+    assert {call[6] for call in adapter.calls if call[0] == "capture"} == {0.10}
     assert result.report["validation"]["passed"] is True
     assert len([call for call in adapter.calls if call[0] == "capture"]) == 9
     plugin.apply("adaptive-stock-result")
@@ -883,6 +1051,7 @@ def test_parameterized_candidate_runs_full_validation_and_preserves_identifier()
     captures = [call for call in adapter.calls if call[0] == "capture"]
     assert len(captures) == 9
     assert {call[4] for call in captures} == {30.25}
+    assert {call[6] for call in captures} == {0.10}
     plugin.apply("generalized-result")
     plugin.stage("generalized-result")
     assert adapter.calls[-1][0] == "stage"
@@ -891,7 +1060,8 @@ def test_parameterized_candidate_runs_full_validation_and_preserves_identifier()
 @pytest.mark.parametrize("profile", ["experimental_mzv", "adaptive_stock"])
 def test_unsupported_installed_klipper_abstains_before_capture_or_snapshot(profile):
     class UnsupportedAdapter(ExperimentalAdapter):
-        def preflight_experimental(self, selections=()):
+        def preflight_experimental(self, selections=(), max_vibrations=None):
+            del max_vibrations
             self.calls.append(("capability", tuple(selections)))
             raise RuntimeError("legacy shaper_defs has no parameterized parser")
 

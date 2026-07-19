@@ -10,7 +10,12 @@ import numpy as np
 from klipper_advanced_shaper import __version__
 from klipper_advanced_shaper.shapers import NATIVE_SHAPER_ORDER, parse_shaper_identifier
 
-from .experimental import damping_samples, optimize_generalized_mzv
+from .experimental import (
+    damping_samples,
+    generalized_mzv_pulses,
+    optimize_generalized_mzv,
+    oscillator_response,
+)
 from .models import CandidateScore, Spectrum
 from .modes import find_modes
 from .selection import PROFILES, select_candidate
@@ -86,6 +91,7 @@ def _candidate_scores(
     repeatability: float,
     cross_ratio: float,
     comparison_spectrum: Optional[Spectrum] = None,
+    cross_comparison_spectrum: Optional[Spectrum] = None,
 ) -> list[CandidateScore]:
     grouped: dict[str, list[Mapping[str, Any]]] = {}
     for capture in captures:
@@ -96,6 +102,10 @@ def _candidate_scores(
         frequency = np.asarray([float(row["frequency"]) for row in rows])
         residuals = [float(row["residual_vibration"]) for row in rows]
         residual_metric = "klipper_native_vibration_fraction"
+        candidate_cross_axis_energy = cross_ratio
+        cross_axis_metadata = {
+            "cross_axis_metric": "measured_unshaped_cross_to_main_energy_ratio",
+        }
         sensitivity = float(np.ptp(frequency) / max(np.mean(frequency), 1e-9))
         if comparison_spectrum is not None:
             common_residuals = []
@@ -130,6 +140,35 @@ def _candidate_scores(
             residuals = common_residuals
             residual_metric = "common_klipper_thresholded_vibration_fraction"
             sensitivity = float(np.ptp(common_residuals))
+            if cross_comparison_spectrum is None:
+                continue
+            cross_residuals = []
+            for row in rows:
+                response = row.get("native_frequency_response")
+                assert isinstance(response, Mapping)
+                try:
+                    cross_residuals.append(
+                        _response_weighted_residual(
+                            cross_comparison_spectrum,
+                            np.asarray(response["frequency_hz"], dtype=float),
+                            np.asarray(response["response_ratio"], dtype=float),
+                            empty_value=0.0,
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    cross_residuals = []
+                    break
+            if len(cross_residuals) != len(rows):
+                continue
+            candidate_cross_axis_energy = float(np.median(cross_residuals))
+            cross_axis_metadata = {
+                "cross_axis_metric": "predicted_cross_axis_residual_fraction",
+                "cross_axis_model": (
+                    "native_frequency_response_weighted_training_cross_psd"
+                ),
+                "cross_axis_aggregation": "median_across_training_captures",
+                "unshaped_cross_to_main_energy_ratio": cross_ratio,
+            }
         scores.append(
             CandidateScore(
                 name=name,
@@ -140,7 +179,7 @@ def _candidate_scores(
                 repeatability=max(
                     repeatability, float(np.std(frequency) / max(np.mean(frequency), 1e-9))
                 ),
-                cross_axis_energy=cross_ratio,
+                cross_axis_energy=candidate_cross_axis_energy,
                 sensitivity=sensitivity,
                 metadata={
                     "family": "native",
@@ -160,10 +199,84 @@ def _candidate_scores(
                     "resonance_validated_acceleration_mm_s2": None,
                     "print_validated_acceleration_mm_s2": None,
                     "acceleration_evidence": "theoretical",
+                    **cross_axis_metadata,
                 },
             )
         )
     return scores
+
+
+def _response_weighted_residual(
+    spectrum: Spectrum,
+    response_frequency_hz: np.ndarray,
+    response_ratio: np.ndarray,
+    *,
+    empty_value: Optional[float] = None,
+) -> float:
+    """Return response-weighted residual power on one measured spectrum."""
+    frequencies = np.asarray(response_frequency_hz, dtype=float)
+    response = np.asarray(response_ratio, dtype=float)
+    if (
+        frequencies.ndim != 1
+        or response.shape != frequencies.shape
+        or frequencies.size < 2
+        or not np.all(np.isfinite(frequencies))
+        or not np.all(np.isfinite(response))
+        or np.any(response < 0.0)
+    ):
+        raise ValueError("candidate response is not a finite non-negative curve")
+    power = np.asarray(spectrum.values, dtype=float)
+    threshold = float(np.max(power)) / 20.0
+    meaningful = np.maximum(power - threshold, 0.0)
+    denominator = float(np.sum(meaningful))
+    if denominator <= 0.0:
+        if empty_value is not None:
+            return float(empty_value)
+        raise ValueError("comparison spectrum has no meaningful power")
+    interpolated = np.interp(spectrum.frequencies, frequencies, response)
+    return float(np.sum(np.maximum(interpolated * power - threshold, 0.0))) / denominator
+
+
+def _generalized_cross_axis_residual(
+    spectrum: Spectrum,
+    candidate: Mapping[str, Any],
+    damping_uncertainty: Sequence[float],
+) -> tuple[float, dict[str, Any]]:
+    """Conservatively predict generalized-MZV cross residual over damping uncertainty."""
+    amplitudes, times = generalized_mzv_pulses(
+        int(candidate["pulse_count"]),
+        float(candidate["spacing"]),
+        float(candidate["frequency_hz"]),
+        float(candidate["design_damping_ratio"]),
+    )
+    values = []
+    samples = [float(value) for value in damping_uncertainty]
+    if not samples:
+        raise ValueError("generalized cross-axis model requires damping uncertainty")
+    for damping in samples:
+        response = oscillator_response(
+            amplitudes,
+            times,
+            spectrum.frequencies,
+            damping,
+        )
+        values.append(
+            _response_weighted_residual(
+                spectrum,
+                spectrum.frequencies,
+                response,
+                empty_value=0.0,
+            )
+        )
+    q95 = float(np.quantile(np.asarray(values, dtype=float), 0.95))
+    return q95, {
+        "cross_axis_metric": "predicted_cross_axis_residual_fraction_q95",
+        "cross_axis_model": "oscillator_response_weighted_training_cross_psd",
+        "cross_axis_aggregation": "damping_uncertainty_q95",
+        "cross_axis_residual_median": float(np.median(values)),
+        "cross_axis_residual_q95": q95,
+        "cross_axis_damping_sample_count": len(samples),
+    }
 
 
 def _common_grid(rows: Sequence[Mapping[str, Any]], frequency_key: str) -> np.ndarray:
@@ -359,6 +472,7 @@ def analyze_calibration(
     snapshot: Any,
     held_out_captures: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
     validation_captures: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
+    validation_pair_ids: Optional[Mapping[str, Sequence[str]]] = None,
     prior_report: Optional[Mapping[str, Any]] = None,
     experimental_mode: bool = False,
     executor_pulse_limit: int = 10,
@@ -374,6 +488,7 @@ def analyze_calibration(
         details = {}
         passed = True
         for axis in axes:
+            explicit_pairing = validation_pair_ids is not None
             modes = (prior_report or {}).get("axes", {}).get(axis, {}).get("modes", [])
             bands = [
                 (max(5.0, m["frequency"] - 5.0), min(200.0, m["frequency"] + 5.0)) for m in modes
@@ -381,6 +496,20 @@ def analyze_calibration(
             if not bands:
                 return {"validation": {"passed": False, "reason": "no modal bands"}}
             try:
+                pair_ids = (
+                    list(validation_pair_ids[axis])
+                    if validation_pair_ids is not None
+                    else [
+                        "%s-%02d" % (axis, index + 1)
+                        for index in range(len(held_out_captures[axis]))
+                    ]
+                )
+                if (
+                    len(pair_ids) != len(held_out_captures[axis])
+                    or len(pair_ids) != len(validation_captures[axis])
+                    or len(set(pair_ids)) != len(pair_ids)
+                ):
+                    raise ValueError("validation pair IDs must uniquely match both capture lists")
                 baseline, baseline_cross, reference_qc = _energies(
                     held_out_captures[axis], axis, bands
                 )
@@ -414,15 +543,40 @@ def analyze_calibration(
             axis_passed = low >= 0.10 and cross_regression <= 0.05
             passed = passed and axis_passed
             details[axis] = {
+                "energy_units": "acceleration_squared",
                 "baseline_energy": float(np.mean(baseline)),
                 "shaped_energy": float(np.mean(shaped)),
+                "reference_energy_samples": baseline.tolist(),
+                "candidate_energy_samples": shaped.tolist(),
                 "improvement_ci_95": [low, high],
                 "reference_cross_axis_energy": float(np.mean(baseline_cross)),
                 "candidate_cross_axis_energy": float(np.mean(shaped_cross)),
+                "reference_cross_axis_energy_samples": baseline_cross.tolist(),
+                "candidate_cross_axis_energy_samples": shaped_cross.tolist(),
                 "cross_axis_regression": cross_regression,
                 "qc_passed": True,
                 "reference_qc": reference_qc,
                 "candidate_qc": candidate_qc,
+                "pair_ids": pair_ids,
+                "pair_count": len(pair_ids),
+                "paired_energy_observations": [
+                    {
+                        "pair_id": pair_id,
+                        "reference_energy": float(reference_energy),
+                        "candidate_energy": float(candidate_energy),
+                        "reference_cross_axis_energy": float(reference_cross),
+                        "candidate_cross_axis_energy": float(candidate_cross),
+                    }
+                    for pair_id, reference_energy, candidate_energy,
+                    reference_cross, candidate_cross in zip(
+                        pair_ids, baseline, shaped, baseline_cross, shaped_cross
+                    )
+                ],
+                "capture_design": (
+                    "paired_interleaved_ab"
+                    if explicit_pairing
+                    else "paired_by_list_position_order_unverified"
+                ),
                 "passed": axis_passed,
             }
         return {
@@ -465,6 +619,7 @@ def analyze_calibration(
             float(np.median(mad)),
             cross_energy / max(main_energy, 1e-12),
             aggregate if profile == "adaptive_stock" else None,
+            cross_aggregate if profile == "adaptive_stock" else None,
         )
         if not scores:
             return {"abstain": True, "reason": "%s native candidate data unavailable" % axis}
@@ -531,6 +686,20 @@ def analyze_calibration(
             )
             for canonical, item in generalized_by_name.items():
                 theoretical = float(item["smoothing_max_accel"])
+                try:
+                    candidate_cross_axis_energy, cross_axis_metadata = (
+                        _generalized_cross_axis_residual(
+                            cross_aggregate,
+                            item,
+                            generalized_report["measured_damping_samples"],
+                        )
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    return {
+                        "abstain": True,
+                        "reason": "%s generalized cross-axis modeling failed: %s"
+                        % (axis, error),
+                    }
                 scores.append(
                     CandidateScore(
                         name=canonical,
@@ -543,7 +712,7 @@ def analyze_calibration(
                         smoothing=float(item["path_error_at_5000"]),
                         max_accel=theoretical,
                         repeatability=float(np.median(mad)),
-                        cross_axis_energy=cross_energy / max(main_energy, 1e-12),
+                        cross_axis_energy=candidate_cross_axis_energy,
                         sensitivity=float(item["sensitivity"]),
                         metadata={
                             "family": "generalized_mzv",
@@ -570,6 +739,7 @@ def analyze_calibration(
                             "strongest_measured_peak_hz": generalized_report[
                                 "strongest_measured_peak_hz"
                             ],
+                            **cross_axis_metadata,
                         },
                     )
                 )

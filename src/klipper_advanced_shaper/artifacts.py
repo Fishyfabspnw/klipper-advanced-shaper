@@ -19,6 +19,7 @@ import numpy as np
 BLUE = "#2563eb"
 ORANGE = "#ea580c"
 GOLD = "#ca8a04"
+GREEN = "#15803d"
 SLATE = "#64748b"
 INK = "#172033"
 
@@ -74,6 +75,102 @@ def _validation_axes(report: Mapping[str, Any]) -> Mapping[str, Any]:
         return {}
     axes = validation.get("axes", {})
     return axes if isinstance(axes, Mapping) else {}
+
+
+def _axis_selection(
+    report: Mapping[str, Any], collection: str, axis: str
+) -> Mapping[str, Any]:
+    values = report.get(collection, [])
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return {}
+    for value in values:
+        if isinstance(value, Mapping) and str(value.get("axis", "")).upper() == axis.upper():
+            return value
+    return {}
+
+
+def _selection_description(selection: Mapping[str, Any], fallback: str) -> str:
+    shaper_type = str(selection.get("shaper_type", fallback))
+    frequency = _finite(selection.get("frequency_hz"))
+    damping = _finite(selection.get("damping_ratio"))
+    parameters = []
+    if frequency is not None:
+        parameters.append(f"{frequency:.3f} Hz")
+    if damping is not None:
+        parameters.append(f"damping {damping:.4f}")
+    return shaper_type + (" · " + " · ".join(parameters) if parameters else "")
+
+
+def _normalized_validation_plot_data(
+    report: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Return display-only axis-normalized held-out evidence for plotting."""
+    normalized = []
+    for axis, values in _validation_axes(report).items():
+        if not isinstance(values, Mapping):
+            continue
+        try:
+            reference = np.asarray(values.get("reference_energy_samples", []), dtype=float)
+            candidate = np.asarray(values.get("candidate_energy_samples", []), dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if not reference.size or not candidate.size:
+            baseline = _finite(values.get("baseline_energy"))
+            shaped = _finite(values.get("shaped_energy"))
+            if baseline is None or shaped is None:
+                continue
+            reference = np.asarray([baseline], dtype=float)
+            candidate = np.asarray([shaped], dtype=float)
+        if (
+            reference.ndim != 1
+            or candidate.shape != reference.shape
+            or np.any(~np.isfinite(reference))
+            or np.any(~np.isfinite(candidate))
+        ):
+            continue
+        reference_mean = float(np.mean(reference))
+        if reference_mean <= 0.0:
+            continue
+        ci = values.get("improvement_ci_95", [])
+        ci_low = (
+            _finite(ci[0])
+            if isinstance(ci, Sequence) and not isinstance(ci, (str, bytes)) and len(ci)
+            else None
+        )
+        ci_high = (
+            _finite(ci[1])
+            if isinstance(ci, Sequence) and not isinstance(ci, (str, bytes)) and len(ci) > 1
+            else None
+        )
+        selected = _axis_selection(report, "selections", str(axis))
+        selected_details = _axes(report).get(axis, {})
+        selected_fallback = (
+            str(selected_details.get("selected", "candidate"))
+            if isinstance(selected_details, Mapping)
+            else "candidate"
+        )
+        reference_selection = _axis_selection(report, "reference", str(axis))
+        normalized.append(
+            {
+                "axis": str(axis),
+                "reference": reference / reference_mean,
+                "candidate": candidate / reference_mean,
+                "candidate_mean": float(np.mean(candidate) / reference_mean),
+                "paired_residual_mean": float(np.mean(candidate / reference)),
+                "candidate_ci": (
+                    (1.0 - ci_high, 1.0 - ci_low)
+                    if ci_low is not None and ci_high is not None
+                    else None
+                ),
+                "passed": values.get("passed"),
+                "cross_axis_regression": _finite(values.get("cross_axis_regression")),
+                "reference_label": _selection_description(
+                    reference_selection, "configured baseline"
+                ),
+                "candidate_label": _selection_description(selected, selected_fallback),
+            }
+        )
+    return tuple(normalized)
 
 
 def _selected_candidate(details: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -324,6 +421,7 @@ class ArtifactWriter:
             "axis", "candidate", "frequency_hz", "max_accel_mm_s2", "smoothing",
             "residual_vibration_fraction", "repeatability", "cross_axis_energy",
             "sensitivity", "residual_metric", "acceleration_evidence",
+            "cross_axis_metric", "cross_axis_model",
             "resonance_validated_accel_mm_s2", "print_validated_accel_mm_s2",
             "pareto", "selected",
         ]]
@@ -344,6 +442,8 @@ class ArtifactWriter:
                     candidate.get("repeatability", ""), candidate.get("cross_axis_energy", ""),
                     candidate.get("sensitivity", ""), metadata.get("residual_metric", ""),
                     metadata.get("acceleration_evidence", ""),
+                    metadata.get("cross_axis_metric", ""),
+                    metadata.get("cross_axis_model", ""),
                     metadata.get("resonance_validated_acceleration_mm_s2", ""),
                     metadata.get("print_validated_acceleration_mm_s2", ""),
                     str(name.lower() in pareto).lower(),
@@ -354,9 +454,13 @@ class ArtifactWriter:
     @staticmethod
     def _validation_csv(report: Mapping[str, Any]) -> list[list[Any]]:
         rows: list[list[Any]] = [[
-            "axis", "baseline_energy", "shaped_energy", "attenuation_ci95_low",
+            "axis", "reference_shaper", "candidate_shaper", "energy_units",
+            "baseline_energy", "shaped_energy", "reference_energy_samples",
+            "candidate_energy_samples", "attenuation_ci95_low",
             "attenuation_ci95_high", "reference_cross_axis_energy",
-            "candidate_cross_axis_energy", "cross_axis_regression", "qc_passed", "passed",
+            "candidate_cross_axis_energy", "reference_cross_axis_energy_samples",
+            "candidate_cross_axis_energy_samples", "cross_axis_regression", "qc_passed", "passed",
+            "capture_design", "pair_count", "pair_ids",
         ]]
         for axis, values in _validation_axes(report).items():
             if not isinstance(values, Mapping):
@@ -364,13 +468,37 @@ class ArtifactWriter:
             ci = values.get("improvement_ci_95", ["", ""])
             if not isinstance(ci, Sequence) or isinstance(ci, (str, bytes)):
                 ci = ["", ""]
+            reference = _axis_selection(report, "reference", str(axis))
+            selection = _axis_selection(report, "selections", str(axis))
+            selected_details = _axes(report).get(axis, {})
+            selected_fallback = (
+                str(selected_details.get("selected", ""))
+                if isinstance(selected_details, Mapping)
+                else ""
+            )
             rows.append([
-                axis, values.get("baseline_energy", ""), values.get("shaped_energy", ""),
+                axis,
+                _selection_description(reference, "configured baseline"),
+                _selection_description(selection, selected_fallback),
+                values.get("energy_units", ""),
+                values.get("baseline_energy", ""), values.get("shaped_energy", ""),
+                json.dumps(values.get("reference_energy_samples", []), separators=(",", ":")),
+                json.dumps(values.get("candidate_energy_samples", []), separators=(",", ":")),
                 ci[0] if len(ci) else "", ci[1] if len(ci) > 1 else "",
                 values.get("reference_cross_axis_energy", ""),
                 values.get("candidate_cross_axis_energy", ""),
+                json.dumps(
+                    values.get("reference_cross_axis_energy_samples", []),
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    values.get("candidate_cross_axis_energy_samples", []),
+                    separators=(",", ":"),
+                ),
                 values.get("cross_axis_regression", ""), values.get("qc_passed", ""),
                 values.get("passed", ""),
+                values.get("capture_design", ""), values.get("pair_count", ""),
+                "|".join(str(item) for item in values.get("pair_ids", [])),
             ])
         return rows
 
@@ -471,27 +599,105 @@ class ArtifactWriter:
         plots[1].tick_params(axis="x", rotation=18, labelsize=8)
         plots[1].grid(True, axis="y")
 
-        validation = _validation_axes(report)
-        labels, before, after = [], [], []
-        for axis, values in validation.items():
-            if not isinstance(values, Mapping):
-                continue
-            base, shaped = _finite(values.get("baseline_energy")), _finite(values.get("shaped_energy"))
-            if base is not None and shaped is not None:
-                labels.append(str(axis))
-                before.append(base)
-                after.append(shaped)
-        positions = np.arange(len(labels) or 1)
-        plots[2].bar(positions - 0.18, before or [0.0], 0.36, label="Held-out reference",
-                     color=ORANGE, edgecolor="#9a3412")
-        plots[2].bar(positions + 0.18, after or [0.0], 0.36, label="Shaped candidate",
-                     color=BLUE, edgecolor="#1e40af", hatch="//")
-        plots[2].set_xticks(positions, labels or ["Validation pending"])
-        plots[2].set(title="Held-out validation · lower resonant-band energy is better",
-                     ylabel="Integrated resonant-band energy (acceleration²)")
+        normalized_validation = _normalized_validation_plot_data(report)
+        positions = np.arange(len(normalized_validation) or 1)
+        if normalized_validation:
+            candidate_means = [item["candidate_mean"] for item in normalized_validation]
+            plots[2].bar(
+                positions - 0.18, [1.0] * len(normalized_validation), 0.36,
+                label="A · configured reference mean", color=ORANGE,
+                edgecolor="#9a3412", alpha=0.72,
+            )
+            plots[2].bar(
+                positions + 0.18, candidate_means, 0.36,
+                label="B · selected candidate mean", color=BLUE,
+                edgecolor="#1e40af", alpha=0.72,
+            )
+            labels = []
+            plot_highest = 1.0
+            for position, item in zip(positions, normalized_validation):
+                reference = item["reference"]
+                candidate = item["candidate"]
+                axis_highest = max(float(np.max(reference)), float(np.max(candidate)))
+                jitter = (
+                    np.linspace(-0.055, 0.055, len(reference))
+                    if len(reference) > 1 else np.asarray([0.0])
+                )
+                plots[2].scatter(
+                    position - 0.18 + jitter, reference, color="#9a3412",
+                    edgecolor="white", linewidth=0.6, zorder=4,
+                    label="Individual paired observations" if position == 0 else None,
+                )
+                plots[2].scatter(
+                    position + 0.18 + jitter, candidate, color="#1e40af",
+                    edgecolor="white", linewidth=0.6, zorder=4,
+                )
+                for offset, reference_value, candidate_value in zip(
+                    jitter, reference, candidate
+                ):
+                    plots[2].plot(
+                        [position - 0.18 + offset, position + 0.18 + offset],
+                        [reference_value, candidate_value],
+                        color="#94a3b8", linewidth=0.7, alpha=0.7, zorder=3,
+                    )
+                ci = item["candidate_ci"]
+                if ci is not None:
+                    ci_low, ci_high = ci
+                    mean = item["paired_residual_mean"]
+                    plots[2].errorbar(
+                        position + 0.18, mean,
+                        yerr=[[max(0.0, mean - ci_low)], [max(0.0, ci_high - mean)]],
+                        fmt="D", color=INK, markerfacecolor="white", markersize=4,
+                        ecolor=INK, elinewidth=1.5, capsize=5, zorder=5,
+                        label="Paired residual mean and 95% CI" if position == 0 else None,
+                    )
+                    axis_highest = max(axis_highest, ci_high)
+                plot_highest = max(plot_highest, axis_highest)
+                state = (
+                    "PASS" if item["passed"] is True else
+                    "REJECT" if item["passed"] is False else "PENDING"
+                )
+                state_color = (
+                    GREEN if item["passed"] is True else
+                    ORANGE if item["passed"] is False else GOLD
+                )
+                cross = item["cross_axis_regression"]
+                status = state + (f"\ncross {cross:+.1%}" if cross is not None else "")
+                plots[2].text(
+                    position, axis_highest + 0.07, status, ha="center", va="bottom",
+                    color=state_color, fontweight="bold", fontsize=8,
+                )
+                labels.append(
+                    f'{item["axis"]}\nA: {item["reference_label"]}\nB: {item["candidate_label"]}'
+                )
+            plots[2].axhline(
+                0.9, color=GREEN, linestyle="--", linewidth=1.2,
+                label="Attenuation gate · B 95% upper bound ≤ 0.90",
+            )
+            validation = report.get("validation", {})
+            overall = (
+                "PASS" if isinstance(validation, Mapping) and validation.get("passed") is True else
+                "REJECT" if isinstance(validation, Mapping) and validation.get("passed") is False else
+                "PENDING"
+            )
+            plots[2].set_xticks(positions, labels)
+            plots[2].set_ylim(0.0, plot_highest + 0.3)
+            plots[2].set(
+                title=f"Held-out paired validation · {overall} · lower is better",
+                ylabel="Normalized resonant-band energy\n(axis reference mean = 1.0; display only)",
+            )
+            plots[2].legend(frameon=False, fontsize=7, ncol=2, loc="upper right")
+        else:
+            plots[2].set_xticks(positions, ["Validation pending"])
+            plots[2].text(
+                0.5, 0.5, "Held-out validation is not available", ha="center", va="center",
+                transform=plots[2].transAxes, color=SLATE,
+            )
+            plots[2].set(
+                title="Held-out paired validation · PENDING",
+                ylabel="Normalized resonant-band energy",
+            )
         plots[2].grid(True, axis="y")
-        if labels:
-            plots[2].legend(frameon=False)
         with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".png", delete=False) as stream:
             temporary = Path(stream.name)
         try:
@@ -892,6 +1098,11 @@ class ArtifactWriter:
                 f"Validation protocol: <strong>{_escape(protocol_label)}</strong>; "
                 "the motion estimate excludes host analysis and artifact time."
             )
+            if protocol.get("capture_design") == "paired_interleaved_ab":
+                findings.append(
+                    "Held-out validation used readback-verified interleaved "
+                    "reference/candidate pairs to reduce time-order drift bias."
+                )
         for axis, details in _axes(report).items():
             if not isinstance(details, Mapping):
                 continue
@@ -923,13 +1134,23 @@ class ArtifactWriter:
         for axis, values in _validation_axes(report).items():
             if not isinstance(values, Mapping):
                 continue
+            reference = _axis_selection(report, "reference", str(axis))
+            selection = _axis_selection(report, "selections", str(axis))
+            selected_details = _axes(report).get(axis, {})
+            selected_fallback = (
+                str(selected_details.get("selected", "candidate"))
+                if isinstance(selected_details, Mapping)
+                else "candidate"
+            )
+            reference_label = _selection_description(reference, "configured baseline")
+            candidate_label = _selection_description(selection, selected_fallback)
             ci = values.get("improvement_ci_95", [])
             low = ci[0] if isinstance(ci, Sequence) and not isinstance(ci, (str, bytes)) and len(ci) else None
             high = ci[1] if isinstance(ci, Sequence) and not isinstance(ci, (str, bytes)) and len(ci) > 1 else None
             passed = values.get("passed")
             gate_label = "Passed" if passed is True else "Failed" if passed is False else "Pending"
             gate_class = "accepted" if passed is True else "rejected" if passed is False else "pending"
-            validation_rows.append(f'''<tr><th scope="row">{_escape(axis)}</th><td>{_number(values.get("baseline_energy"), 4)}</td><td>{_number(values.get("shaped_energy"), 4)}</td><td>{_percent(low)} to {_percent(high)}</td><td>{_percent(values.get("cross_axis_regression"))}</td><td><span class="tag {gate_class}">{gate_label}</span></td></tr>''')
+            validation_rows.append(f'''<tr><th scope="row">{_escape(axis)}</th><td>{_escape(reference_label)}</td><td>{_escape(candidate_label)}</td><td>{_number(values.get("baseline_energy"), 4)}</td><td>{_number(values.get("shaped_energy"), 4)}</td><td>{_percent(low)} to {_percent(high)}</td><td>{_percent(values.get("cross_axis_regression"))}</td><td><span class="tag {gate_class}">{gate_label}</span></td></tr>''')
             cards.append(f'''<article class="metric"><span>Axis {_escape(axis)} attenuation, 95% CI</span><strong>{_percent(low)} to {_percent(high)}</strong><small>Required lower bound: 10.0%</small></article>''')
             cards.append(f'''<article class="metric"><span>Axis {_escape(axis)} cross-axis change</span><strong>{_percent(values.get("cross_axis_regression"))}</strong><small>Maximum permitted regression: 5.0%</small></article>''')
 
@@ -960,7 +1181,7 @@ class ArtifactWriter:
                 % _escape(protocol.get("mode", "unknown"))
             )
         payload = html.escape(json.dumps(report, indent=2, sort_keys=True), quote=False)
-        validation_body = "".join(validation_rows) or '<tr><td colspan="6" class="empty">Held-out validation is not available for this report.</td></tr>'
+        validation_body = "".join(validation_rows) or '<tr><td colspan="8" class="empty">Held-out validation is not available for this report.</td></tr>'
         candidate_body = "".join(candidate_rows) or '<tr><td colspan="8" class="empty">Candidate metrics are not available.</td></tr>'
         axis_body = "".join(axis_sections) or '<p class="empty">No axis selection is available.</p>'
         findings_body = "".join(f"<li>{item}</li>" for item in findings)
@@ -986,10 +1207,10 @@ class ArtifactWriter:
 <section aria-labelledby="findings"><h2 id="findings">Technical summary</h2><ol class="findings">{findings_body}</ol></section>
 <section aria-labelledby="axis"><h2 id="axis">Selection and modal evidence</h2><div class="axis-grid">{axis_body}</div></section>
 <section aria-labelledby="spectrum"><h2 id="spectrum">Input shaper spectrum</h2><p>Klipper-compatible frequency view of the normalized spectral response and evaluated allowlisted candidates. Native component values are unitless normalized or arbitrary response units, not acceleration²/Hz. <a href="{_escape(shaper_svg_name)}">Open the scalable SVG</a>.</p><div class="figure"><img src="{_escape(shaper_png_name)}" alt="Input shaper frequency profile with normalized spectral response traces, detected modal peaks, and allowlisted candidate metrics"></div></section>
-<section aria-labelledby="validation"><h2 id="validation">Before / after held-out validation</h2><div class="table-wrap"><table><thead><tr><th>Axis</th><th>Reference energy</th><th>Shaped energy</th><th>Attenuation 95% CI</th><th>Cross-axis change</th><th>Gate</th></tr></thead><tbody>{validation_body}</tbody></table></div></section>
-<section aria-labelledby="plots"><h2 id="plots">PSD, candidates, and validation plots</h2><div class="figure"><img src="{_escape(png_name)}" alt="Three technical plots showing modal spectrum, candidate acceleration estimates, and held-out reference versus shaped energy"></div></section>
+<section aria-labelledby="validation"><h2 id="validation">Before / after held-out validation</h2><div class="table-wrap"><table><thead><tr><th>Axis</th><th>Configured reference</th><th>Selected candidate</th><th>Reference energy (acceleration²)</th><th>Shaped energy (acceleration²)</th><th>Attenuation 95% CI</th><th>Cross-axis change</th><th>Gate</th></tr></thead><tbody>{validation_body}</tbody></table></div></section>
+<section aria-labelledby="plots"><h2 id="plots">PSD, candidates, and validation plots</h2><div class="figure"><img src="{_escape(png_name)}" alt="Three technical plots showing modal spectrum, theoretical candidate acceleration estimates, and axis-normalized held-out paired validation observations with confidence intervals and gates"></div></section>
 <section aria-labelledby="candidates"><h2 id="candidates">Candidate and Pareto comparison</h2><div class="table-wrap"><table><thead><tr><th>Candidate</th><th>Hz</th><th>Max accel mm/s²</th><th>Residual</th><th>Smoothing</th><th>Repeatability</th><th>Cross-axis</th><th>Sensitivity</th></tr></thead><tbody>{candidate_body}</tbody></table></div></section>
-<section aria-labelledby="method"><h2 id="method">Definitions, method, and uncertainty</h2><div class="method"><article class="panel"><h3>How to read this report</h3><p><strong>Max accel</strong> is Klipper's smoothing-derived theoretical estimate at the captured square-corner velocity; it is not a mechanical safety rating. <strong>Attenuation</strong> compares independent held-out resonant-band energy before and after shaping. The lower bound of its 95% bootstrap confidence interval must reach 10%. <strong>Cross-axis change</strong> must not regress by more than 5%.</p><p>Candidate scores combine residual vibration, smoothing, repeatability, cross-axis energy, and sensitivity. Pareto candidates are non-dominated trade-offs; the selected profile chooses among them.</p></article><article class="panel"><h3>Audit metadata</h3><dl class="audit">{audit_body}</dl></article></div></section>
+<section aria-labelledby="method"><h2 id="method">Definitions, method, and uncertainty</h2><div class="method"><article class="panel"><h3>How to read this report</h3><p><strong>Max accel</strong> is Klipper's smoothing-derived theoretical estimate at the captured square-corner velocity; it is not a mechanical safety rating. <strong>Attenuation</strong> compares paired, interleaved held-out reference and candidate resonant-band energy. The lower bound of its 95% paired-bootstrap confidence interval must reach 10%. <strong>Cross-axis change</strong> must not regress by more than 5%.</p><p>The validation chart divides each axis by its own reference mean for display only; individual dots remain paired observations and the raw acceleration-squared energies remain in JSON and CSV. Its interval validates resonance attenuation, not a physical or print-safe acceleration.</p><p>Adaptive-stock candidate scores use candidate-specific response-weighted predictions for training cross-axis PSD; generalized MZV uses the conservative 95th percentile over measured damping uncertainty. These predictions affect ranking but never replace the measured held-out cross-axis gate. Pareto candidates are non-dominated trade-offs; the selected profile chooses among them.</p></article><article class="panel"><h3>Audit metadata</h3><dl class="audit">{audit_body}</dl></article></div></section>
 <section aria-labelledby="limits"><h2 id="limits">Limitations</h2><div class="panel"><p>Results apply only to the tested sensor mount, toolhead mass, belt state, temperature, fan state, excitation, square-corner velocity, and sampling quality. A smoothing-derived acceleration estimate does not prove stepper torque, frame, hotend flow, or print-quality capability.</p><details><summary>Show exact machine-readable report</summary><pre>{payload}</pre></details></div></section>
 <section aria-labelledby="action"><h2 id="action">Next action</h2><div class="panel next"><p>{_escape(next_action)}</p>{command_block}</div></section>
 <footer>Generated locally and designed for offline review. No external assets, scripts, fonts, or network requests are used. Raw captures remain private and are not exported to CSV.</footer>

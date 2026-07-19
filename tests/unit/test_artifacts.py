@@ -5,6 +5,7 @@ import numpy as np
 
 from klipper_advanced_shaper.artifacts import (
     ArtifactWriter,
+    _normalized_validation_plot_data,
     _plot_candidate_subset,
     _plot_frequency_ceiling,
     _selected_modeled_response,
@@ -97,6 +98,22 @@ def _complete_report(status="accepted"):
         "profile": "performance",
         "reason": "<script>alert('report')</script> confidence gate",
         "square_corner_velocity": 7.0,
+        "reference": [
+            {
+                "axis": "X",
+                "shaper_type": "mzv(n=4,t=0.800000)",
+                "frequency_hz": 75.6,
+                "damping_ratio": 0.038,
+            }
+        ],
+        "selections": [
+            {
+                "axis": "X",
+                "shaper_type": "mzv",
+                "frequency_hz": 74.4,
+                "damping_ratio": 0.08,
+            }
+        ],
         "axes": {
             "X": {
                 "selected": "mzv",
@@ -163,12 +180,20 @@ def _complete_report(status="accepted"):
             "reason": "confidence gate",
             "axes": {
                 "X": {
+                    "energy_units": "acceleration_squared",
                     "baseline_energy": 12.0,
                     "shaped_energy": 9.0,
+                    "reference_energy_samples": [10.0, 14.0],
+                    "candidate_energy_samples": [8.0, 10.0],
                     "improvement_ci_95": [0.12, 0.31],
                     "reference_cross_axis_energy": 2.0,
                     "candidate_cross_axis_energy": 2.04,
+                    "reference_cross_axis_energy_samples": [1.9, 2.1],
+                    "candidate_cross_axis_energy_samples": [2.0, 2.08],
                     "cross_axis_regression": 0.02,
+                    "pair_ids": ["X-01", "X-02"],
+                    "pair_count": 2,
+                    "capture_design": "paired_interleaved_ab",
                     "passed": status == "accepted",
                 }
             },
@@ -200,7 +225,28 @@ def test_polished_report_has_decision_metrics_csv_and_no_network_assets(tmp_path
     assert (output / "validation.csv").is_file()
     assert "raw" not in artifacts
     assert "mzv" in (output / "candidates.csv").read_text(encoding="utf-8")
-    assert "0.12" in (output / "validation.csv").read_text(encoding="utf-8")
+    validation_csv = (output / "validation.csv").read_text(encoding="utf-8")
+    assert "0.12" in validation_csv
+    assert "mzv(n=4,t=0.800000)" in validation_csv
+    assert "[10.0,14.0]" in validation_csv
+
+
+def test_validation_plot_is_axis_normalized_display_only_with_exact_labels():
+    report = _complete_report()
+    plotted = _normalized_validation_plot_data(report)
+
+    assert len(plotted) == 1
+    assert plotted[0]["axis"] == "X"
+    assert np.allclose(plotted[0]["reference"], [10.0 / 12.0, 14.0 / 12.0])
+    assert np.allclose(plotted[0]["candidate"], [8.0 / 12.0, 10.0 / 12.0])
+    assert plotted[0]["candidate_mean"] == 0.75
+    assert plotted[0]["paired_residual_mean"] == np.mean([8.0 / 10.0, 10.0 / 14.0])
+    assert plotted[0]["candidate_ci"] == (0.69, 0.88)
+    assert plotted[0]["reference_label"] == (
+        "mzv(n=4,t=0.800000) · 75.600 Hz · damping 0.0380"
+    )
+    assert plotted[0]["candidate_label"] == "mzv · 74.400 Hz · damping 0.0800"
+    assert report["validation"]["axes"]["X"]["reference_energy_samples"] == [10.0, 14.0]
 
 
 def test_rejected_report_leads_with_failure_and_cannot_imply_applicability(tmp_path):
@@ -228,6 +274,13 @@ def test_fast_validation_is_visibly_labeled_with_motion_only_timing(tmp_path):
         "hz_per_sec": 2.0,
         "estimated_motion_seconds_per_axis": 325.0,
         "motion_time_excludes_host_analysis_and_artifact_time": True,
+        "capture_design": "paired_interleaved_ab",
+        "pair_count_per_axis": 2,
+        "pair_ids_by_axis": {"X": ["X-01", "X-02"]},
+        "capture_order": [
+            {"sequence": 1, "axis": "X", "pair_id": "X-01", "condition": "reference"},
+            {"sequence": 2, "axis": "X", "pair_id": "X-01", "condition": "candidate"},
+        ],
     }
     ArtifactWriter(tmp_path, keep_raw=False).write("fast", report)
     rendered = (tmp_path / "fast" / "report.html").read_text(encoding="utf-8")
@@ -236,6 +289,7 @@ def test_fast_validation_is_visibly_labeled_with_motion_only_timing(tmp_path):
     assert "1 train + 2 reference + 2 candidate" in rendered
     assert "5.4 min estimated motion/axis" in rendered
     assert "motion estimate excludes host analysis and artifact time" in rendered
+    assert "readback-verified interleaved reference/candidate pairs" in rendered
 
 
 def test_sparse_report_generates_all_visuals_with_pending_labels(tmp_path):

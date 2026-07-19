@@ -4,6 +4,7 @@ import pickle
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -104,7 +105,8 @@ def test_native_excitation_preflight_resolves_config_and_printer_motion_budget()
         provider.preflight_excitation(("X", "Y"), 150.0, 2.0)
 
 
-def test_native_capture_records_actual_explicit_sweep_rate(monkeypatch):
+@pytest.mark.parametrize("validation", [False, True])
+def test_native_capture_records_actual_explicit_sweep_rate(monkeypatch, validation):
     class TestAxis:
         def __init__(self, axis):
             self.axis = axis
@@ -121,12 +123,16 @@ def test_native_capture_records_actual_explicit_sweep_rate(monkeypatch):
 
     class NativeHelper:
         fitting_damping = None
+        fitting_max_vibrations = None
 
         def __init__(self, _printer):
             pass
 
-        def find_best_shaper(self, *_args, **_kwargs):
+        def find_best_shaper(
+            self, *_args, max_vibrations=None, **_kwargs
+        ):
             NativeHelper.fitting_damping = _kwargs.get("damping_ratio")
+            NativeHelper.fitting_max_vibrations = max_vibrations
             assert _kwargs["shapers"] == (
                 "zv",
                 "mzv",
@@ -175,11 +181,17 @@ def test_native_capture_records_actual_explicit_sweep_rate(monkeypatch):
             pulse.test_hz_per_sec = gcmd.get_float(
                 "HZ_PER_SEC", pulse.hz_per_sec, maxval=2.0
             )
+            timestamps = np.arange(4096, dtype=float) / 1000.0
             return {
                 axes[0]: {
                     "native_data": NativeData(),
-                    "samples": np.array(
-                        [[0.0, 1.0, 0.0, 0.0], [0.1, 2.0, 0.0, 0.0]]
+                    "samples": np.column_stack(
+                        (
+                            timestamps,
+                            np.sin(2.0 * np.pi * 70.0 * timestamps),
+                            0.1 * np.sin(2.0 * np.pi * 70.0 * timestamps),
+                            0.05 * np.sin(2.0 * np.pi * 70.0 * timestamps),
+                        )
                     ),
                 }
             }
@@ -232,11 +244,12 @@ def test_native_capture_records_actual_explicit_sweep_rate(monkeypatch):
     result = provider.capture(
         "X",
         0,
-        validation=True,
+        validation=validation,
         accel_per_hz=150.0,
         hz_per_sec=2.0,
         design_damping_ratio=0.08,
         native_shapers=("zv", "mzv", "zvd", "ei", "2hump_ei", "3hump_ei"),
+        max_vibrations=0.10,
     )
 
     recipe = result["metadata"]["test_recipe"]
@@ -246,9 +259,90 @@ def test_native_capture_records_actual_explicit_sweep_rate(monkeypatch):
         "accel_per_hz": 150.0,
         "hz_per_sec": 2.0,
     }
-    assert NativeHelper.fitting_damping == 0.08
     assert result["metadata"]["native_design_damping_ratio"] == 0.08
-    assert result["native_candidates"][0]["design_damping_ratio"] == 0.08
+    assert result["metadata"]["native_fit_max_vibrations"] == 0.10
+    assert result["native_spectrum"]["available"] is True
+    if not validation:
+        assert NativeHelper.fitting_damping == 0.08
+        assert NativeHelper.fitting_max_vibrations == 0.10
+        assert result["native_candidates"][0]["design_damping_ratio"] == 0.08
+        assert "native_fitting_performed" not in result["metadata"]
+        assert "native_fitting_status" not in result["metadata"]
+        return
+
+    assert NativeHelper.fitting_damping is None
+    assert NativeHelper.fitting_max_vibrations is None
+    assert result["native_candidates"] == []
+    assert result["metadata"]["native_fitting_performed"] is False
+    assert (
+        result["metadata"]["native_fitting_status"]
+        == "skipped_held_out_validation"
+    )
+
+    # Validation analysis consumes the raw samples and QC metadata, not fitted
+    # candidates. A skipped-fit capture remains a valid held-out input.
+    validation_result = analyze_calibration(
+        captures={"X": []},
+        held_out_captures={"X": [result, result]},
+        validation_captures={"X": [result, result]},
+        validation_pair_ids={"X": ["X-01", "X-02"]},
+        axes=("X",),
+        profile="performance",
+        snapshot=SimpleNamespace(square_corner_velocity=5.0, damping_ratio_x=0.08),
+        prior_report={"axes": {"X": {"modes": [{"frequency": 70.0}]}}},
+    )
+    evidence = validation_result["validation"]["axes"]["X"]
+    assert evidence["qc_passed"] is True
+    assert evidence["pair_count"] == 2
+
+
+def test_native_fitting_preflight_rejects_legacy_api_without_max_vibrations():
+    class LegacyHelper:
+        def find_best_shaper(self, calibration_data, damping_ratio=None):
+            del calibration_data, damping_ratio
+
+    provider = NativeResonanceCaptureProvider.__new__(NativeResonanceCaptureProvider)
+    provider._native_fitting_method = lambda: LegacyHelper.find_best_shaper
+
+    with pytest.raises(RuntimeError, match="lacks max_vibrations support"):
+        provider.preflight_native_fitting(0.10)
+
+
+@pytest.mark.parametrize("validation", [False, True])
+def test_native_capture_proves_max_vibrations_support_before_resonance_motion(
+    validation,
+):
+    class LegacyHelper:
+        def find_best_shaper(self, calibration_data, damping_ratio=None):
+            del calibration_data, damping_ratio
+
+    provider = NativeResonanceCaptureProvider.__new__(NativeResonanceCaptureProvider)
+    provider._native_fitting_method = lambda: LegacyHelper.find_best_shaper
+    provider._tester = lambda: pytest.fail("resonance motion must not start")
+
+    with pytest.raises(RuntimeError, match="lacks max_vibrations support"):
+        provider.capture(
+            "X",
+            0,
+            validation=validation,
+            design_damping_ratio=0.08,
+            max_vibrations=0.10,
+        )
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), -0.01, 1.01, "ten-percent"])
+def test_native_fitting_preflight_rejects_unsafe_thresholds(value):
+    class ModernHelper:
+        def find_best_shaper(
+            self, calibration_data, max_vibrations=None
+        ):
+            del calibration_data, max_vibrations
+
+    provider = NativeResonanceCaptureProvider.__new__(NativeResonanceCaptureProvider)
+    provider._native_fitting_method = lambda: ModernHelper.find_best_shaper
+
+    with pytest.raises(RuntimeError, match="max_vibrations threshold"):
+        provider.preflight_native_fitting(value)
 
 
 def test_capture_helper_supports_v013_single_argument_callback():
@@ -288,9 +382,10 @@ def test_adapter_passes_active_axis_damping_into_native_fitting():
     assert result["axis"] == "X"
     assert result["repeat"] == 2
     assert result["native_shapers"] is None
+    assert result["max_vibrations"] is None
 
     adapter.configure_capture_profile("adaptive_stock")
-    adaptive = adapter.capture("X", 3, validation=True)
+    adaptive = adapter.capture("X", 3, validation=True, max_vibrations=0.10)
     assert adaptive["native_shapers"] == (
         "zv",
         "mzv",
@@ -299,6 +394,7 @@ def test_adapter_passes_active_axis_damping_into_native_fitting():
         "2hump_ei",
         "3hump_ei",
     )
+    assert adaptive["max_vibrations"] == 0.10
 
 
 def test_capture_result_combines_multiple_probe_points_without_timestamp_gap():

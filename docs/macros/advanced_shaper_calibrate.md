@@ -51,7 +51,7 @@ Here are the available parameters:
 | `quality` | Prefers lower residual vibration and retains the ordinary native candidate path. |
 | `balanced` | Balances residual vibration, smoothing, repeatability, and cross-axis response on the ordinary native path. |
 | `performance` | Gives more weight to the theoretical smoothing acceleration while retaining residual-vibration gates. |
-| `experimental_mzv` | Searches only strict canonical `mzv(n=...,t=...)` or `mzv(n=...,tau=...)` candidates supported by the installed Klipper build. |
+| `experimental_mzv` | Searches strict canonical `mzv(n=...,t=...)` candidates supported by the installed Klipper build. Validated existing MZV snapshots may retain canonical `tau` syntax during readback and restoration. |
 | `adaptive_stock` | Compares native ZV, MZV, ZVD, EI, 2HUMP_EI, and 3HUMP_EI with capability-proven generalized MZV. It may keep a native winner. |
 
 The ordinary profiles do not silently add ZVD or parameterized shapers to

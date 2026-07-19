@@ -207,10 +207,12 @@ separately invoke `SAVE_CONFIG` to persist them. Neither command changes
 `[printer] max_accel`. Calibration never automatically applies, stages, saves,
 or changes heater, fan, motor-current, or persistent acceleration settings.
 
-With `VALIDATE=1`, each axis uses three fitting sweeps, three independent
+With `REPEATS=3 VALIDATE=1`, each axis uses three fitting sweeps, three
 held-out sweeps using the shaper active at session start, and three sweeps using
-the proposed shaper. To compare directly against a Shake&Tune result, apply that
-reference result for the runtime before starting the session. The
+the proposed shaper. Experimental profiles require this full-confidence repeat
+count unless the explicit fast protocol is selected. Native profiles use the
+requested `REPEATS` value. To compare directly against a Shake&Tune result, apply
+that reference result for the runtime before starting the session. The
 candidate is accepted only when the 95% confidence interval demonstrates at
 least 10% resonant-band attenuation. Every temporary setting is restored before
 the result becomes reviewable.
@@ -246,8 +248,8 @@ accepts neither one nor three for `REPEATS`, requires explicit
 `HZ_PER_SEC=2`, and never makes a rejected result eligible for apply or stage.
 The default experimental path remains at least three repeats.
 
-Observed operational note: live attempt `9a822d6fdc4b` completed all 18 sweeps,
-was rejected safely by validation, and reported restoration of the baseline.
+Validation-rejected attempts retain diagnostic artifacts only after successful
+rollback and never become eligible for apply or stage.
 
 For a supervised native-profile capture-path smoke test, an operator may use:
 
@@ -268,7 +270,12 @@ explicit fast repeat protocol. Before any experimental sweep, the plugin probes
 the installed `shaper_defs` implementation and generic executor. Current stock
 Klipper builds that provide the required allowlisted APIs work without core
 patches. Older, incompatible, or vendor-modified builds abstain; there is no
-silent compatibility fallback. After every temporary `SET_INPUT_SHAPER`,
+silent compatibility fallback. These two profiles also ask upstream Klipper's
+native fitter for a profile-derived `max_vibrations` limit (currently 10%).
+That is a per-family frequency-fitting constraint, not the separate held-out
+10% attenuation-improvement gate; ordinary profiles omit it and retain legacy
+native fitting. Installed Klipper must explicitly support the parameter or
+preflight abstains before motion. After every temporary `SET_INPUT_SHAPER`,
 Klipper status must read back the exact canonical axis, identifier, frequency,
 and damping before validation can continue.
 

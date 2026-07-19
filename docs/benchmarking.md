@@ -12,7 +12,9 @@ settings, temperature, and fan state. Do not compare runs with different values
 without a documented normalization method.
 
 Use at least three fitting captures and three separate validation captures per
-axis and candidate. Randomize candidate order where practical. Reject runs with
+axis and candidate. Run validation as within-axis, readback-verified interleaved
+reference/candidate pairs and retain pair IDs so time drift does not become an
+untracked block-order confounder. Reject runs with
 sensor clipping, timing dropout, inadequate Nyquist margin, excess noise,
 Klipper timing faults, MCU faults, or failed state restoration.
 
@@ -25,7 +27,8 @@ For the initial target printer, the reference thresholds are:
 | X | MZV at 74.4 Hz | 16,150 mm/s² | 1.4% |
 | Y | 2HUMP_EI at 76.4 Hz | 5,840 mm/s² | To be measured from raw capture |
 
-An advanced candidate passes only if all of the following hold:
+For a separate target-printer benchmark, declare a benchmark pass only if all
+of the following hold:
 
 - Its acceleration estimate exceeds the axis reference under the same smoothing
   model and square-corner velocity.
@@ -34,6 +37,10 @@ An advanced candidate passes only if all of the following hold:
 - Cross-axis energy does not regress by more than 5%.
 - Every included capture passes quality checks and the calibration restores the
   printer state without errors.
+
+These target-printer reference values are not plugin acceptance gates unless
+they are configured through `minimum_max_accel_x` and `minimum_max_accel_y`.
+An accepted calibration alone is not a benchmark pass.
 
 Report theoretical shaping acceleration separately from acceleration actually
 validated at a recorded resonance-test acceleration and from acceleration

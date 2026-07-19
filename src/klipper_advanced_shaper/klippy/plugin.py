@@ -46,6 +46,22 @@ def _parse_peak_lock(value: Any) -> bool:
     raise ValueError("PEAK_LOCK must be numeric 0 or 1")
 
 
+def _profile_max_vibrations(profile: str) -> Optional[float]:
+    if profile not in {"experimental_mzv", "adaptive_stock"}:
+        return None
+    from klipper_advanced_shaper.analysis.selection import PROFILES
+
+    value = PROFILES[profile].maximum_residual
+    if value is None:
+        raise RuntimeError("experimental profile lacks a native fitting residual limit")
+    threshold = float(value)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise RuntimeError(
+            "experimental profile native fitting residual limit must be within [0, 1]"
+        )
+    return threshold
+
+
 def _analysis_unavailable(**_: Any) -> Mapping[str, Any]:
     """Spawn-picklable fallback used when the analysis package cannot load."""
     raise RuntimeError("analysis engine is unavailable")
@@ -170,6 +186,7 @@ class AdvancedInputShaper:
         fast_validation_enabled = _parse_fast_validation(fast_validation)
         peak_lock_enabled = _parse_peak_lock(peak_lock)
         experimental_mode = profile in {"experimental_mzv", "adaptive_stock"}
+        max_vibrations = _profile_max_vibrations(profile)
         if experimental_mode and not self.experimental_enabled:
             raise ValueError(
                 "%s requires enable_experimental_generalized_mzv: True" % profile
@@ -217,6 +234,31 @@ class AdvancedInputShaper:
                 "command" if selected_scv is not None else "printer_snapshot"
             ),
         }
+        if max_vibrations is not None:
+            validation_protocol["native_fit_max_vibrations"] = {
+                "fraction": max_vibrations,
+                "percent": max_vibrations * 100.0,
+                "source": "selection_profile.maximum_residual",
+                "upstream_parameter": "max_vibrations",
+            }
+        if validate:
+            pair_ids_by_axis = {
+                axis: ["%s-%02d" % (axis, index + 1) for index in range(repeats)]
+                for axis in normalized_axes
+            }
+            validation_protocol.update(
+                {
+                    "capture_design": "paired_interleaved_ab",
+                    "condition_labels": {"A": "reference", "B": "candidate"},
+                    "pair_count_per_axis": repeats,
+                    "total_pair_count": repeats * len(normalized_axes),
+                    "pair_ids_by_axis": pair_ids_by_axis,
+                    "capture_order": [],
+                    "temporary_apply_readback": "exact_status_before_every_capture",
+                }
+            )
+        else:
+            pair_ids_by_axis = {}
         if fast_validation_enabled:
             validation_protocol.update(
                 {
@@ -274,7 +316,9 @@ class AdvancedInputShaper:
                 capability_probe = getattr(self.adapter, "preflight_experimental", None)
                 if capability_probe is None:
                     raise RuntimeError("adapter cannot prove generalized-MZV runtime support")
-                runtime_capability = capability_probe()
+                runtime_capability = capability_probe(
+                    max_vibrations=max_vibrations
+                )
                 executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             self.machine.checkpoint()
             snapshot = self.adapter.snapshot()
@@ -306,7 +350,9 @@ class AdvancedInputShaper:
                 capability_probe = getattr(self.adapter, "preflight_experimental", None)
                 if capability_probe is None:
                     raise RuntimeError("adapter cannot prove existing parameterized shaper support")
-                runtime_capability = capability_probe(snapshot_selections)
+                runtime_capability = capability_probe(
+                    snapshot_selections, max_vibrations=max_vibrations
+                )
                 executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             self.machine.transition(CalibrationState.BASELINE_CAPTURE)
             for axis in normalized_axes:
@@ -319,6 +365,7 @@ class AdvancedInputShaper:
                             False,
                             accel_per_hz=selected_accel_per_hz,
                             hz_per_sec=selected_hz_per_sec,
+                            max_vibrations=max_vibrations,
                         )
                     )
 
@@ -367,7 +414,9 @@ class AdvancedInputShaper:
                 capability_probe = getattr(self.adapter, "preflight_experimental", None)
                 if capability_probe is None:
                     raise RuntimeError("adapter cannot prove exact parameterized selection")
-                runtime_capability = capability_probe(selections)
+                runtime_capability = capability_probe(
+                    selections, max_vibrations=max_vibrations
+                )
                 executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             report = dict(report)
             report["runtime_capability"] = runtime_capability
@@ -385,39 +434,52 @@ class AdvancedInputShaper:
                     )
                     for axis in normalized_axes
                 )
-                self.adapter.apply_temporary(reference)
                 held_out: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
-                for axis in normalized_axes:
-                    for repeat in range(reference_repeats):
-                        self.machine.checkpoint()
-                        held_out[axis].append(
-                            self.adapter.capture(
-                                axis,
-                                repeat,
-                                validation=True,
-                                accel_per_hz=selected_accel_per_hz,
-                                hz_per_sec=selected_hz_per_sec,
-                            )
-                        )
-                self.adapter.apply_temporary(selections)
                 validation: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
+                capture_order: list[dict[str, Any]] = []
                 for axis in normalized_axes:
-                    for repeat in range(candidate_repeats):
-                        self.machine.checkpoint()
-                        validation[axis].append(
-                            self.adapter.capture(
-                                axis,
-                                repeat,
-                                validation=True,
-                                accel_per_hz=selected_accel_per_hz,
-                                hz_per_sec=selected_hz_per_sec,
+                    for repeat, pair_id in enumerate(pair_ids_by_axis[axis]):
+                        for condition, active, destination in (
+                            ("reference", reference, held_out),
+                            ("candidate", selections, validation),
+                        ):
+                            self.machine.checkpoint()
+                            # KlipperPrinterAdapter.apply_temporary performs exact
+                            # type/frequency/damping/axis status readback before
+                            # this capture is allowed to start.
+                            self.adapter.apply_temporary(active)
+                            self.machine.checkpoint()
+                            destination[axis].append(
+                                self.adapter.capture(
+                                    axis,
+                                    repeat,
+                                    validation=True,
+                                    accel_per_hz=selected_accel_per_hz,
+                                    hz_per_sec=selected_hz_per_sec,
+                                    max_vibrations=max_vibrations,
+                                )
                             )
-                        )
+                            capture_order.append(
+                                {
+                                    "sequence": len(capture_order) + 1,
+                                    "axis": axis,
+                                    "pair_id": pair_id,
+                                    "condition": condition,
+                                    "condition_label": (
+                                        "A" if condition == "reference" else "B"
+                                    ),
+                                    "repeat_index": repeat,
+                                }
+                            )
+                            validation_protocol["capture_order"] = list(capture_order)
+                            self.current_validation_protocol = dict(validation_protocol)
+                report["validation_protocol"] = dict(validation_protocol)
                 validation_report = self._invoke(
                     self.analyzer,
                     captures=captures,
                     held_out_captures=held_out,
                     validation_captures=validation,
+                    validation_pair_ids=pair_ids_by_axis,
                     axes=normalized_axes,
                     profile=profile,
                     snapshot=analysis_snapshot,

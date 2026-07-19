@@ -260,6 +260,46 @@ class NativeResonanceCaptureProvider:
         result["axes"] = list(axes)
         return result
 
+    @staticmethod
+    def _validate_max_vibrations(value: Any) -> float:
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("max_vibrations threshold is not numeric") from error
+        if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise RuntimeError("max_vibrations threshold must be a fraction within [0, 1]")
+        return threshold
+
+    @staticmethod
+    def _native_fitting_method() -> Any:
+        try:
+            native_module = importlib.import_module("extras.shaper_calibrate")
+            return native_module.ShaperCalibrate.find_best_shaper
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "installed Klipper native shaper fitting API is unavailable"
+            ) from error
+
+    def preflight_native_fitting(self, max_vibrations: Any) -> dict[str, Any]:
+        """Prove the opt-in upstream residual threshold is explicitly supported."""
+        threshold = self._validate_max_vibrations(max_vibrations)
+        try:
+            parameters = inspect.signature(self._native_fitting_method()).parameters
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "cannot inspect installed Klipper native shaper fitting API"
+            ) from error
+        if "max_vibrations" not in parameters:
+            raise RuntimeError(
+                "installed Klipper find_best_shaper lacks max_vibrations support"
+            )
+        return {
+            "passed": True,
+            "parameter": "max_vibrations",
+            "fraction": threshold,
+            "percent": threshold * 100.0,
+        }
+
     def capture(
         self,
         axis: str,
@@ -269,11 +309,19 @@ class NativeResonanceCaptureProvider:
         hz_per_sec: Optional[float] = None,
         design_damping_ratio: Optional[float] = None,
         native_shapers: Optional[tuple[str, ...]] = None,
+        max_vibrations: Optional[float] = None,
     ) -> dict[str, Any]:
         if design_damping_ratio is None or not np.isfinite(design_damping_ratio):
             raise RuntimeError("active input-shaper damping is required for native fitting")
         if not 0.0 <= float(design_damping_ratio) < 1.0:
             raise RuntimeError("active input-shaper damping must be within [0, 1)")
+        if native_shapers is not None and tuple(native_shapers) != NATIVE_SHAPER_ORDER:
+            raise RuntimeError("native shaper override is outside the stock allowlist")
+        fitting_proof = (
+            self.preflight_native_fitting(max_vibrations)
+            if max_vibrations is not None
+            else None
+        )
         tester = self._tester()
         module = importlib.import_module(tester.__class__.__module__)
         test_axis = module.TestAxis(axis.lower())
@@ -298,32 +346,40 @@ class NativeResonanceCaptureProvider:
         data = result["native_data"]
         data.normalize_to_frequencies()
         result["native_spectrum"] = _native_spectrum(data)
-        eventtime = self.printer.get_reactor().monotonic()
-        scv = self.printer.lookup_object("toolhead").get_status(eventtime)["square_corner_velocity"]
-        max_frequency = tester._get_max_calibration_freq()
-        fit_arguments = {
-            "damping_ratio": float(design_damping_ratio),
-            "max_smoothing": getattr(tester, "max_smoothing", None),
-            "scv": scv,
-            "max_freq": max_frequency,
-            "logger": lambda _message: None,
-        }
-        if native_shapers is not None:
-            if tuple(native_shapers) != NATIVE_SHAPER_ORDER:
-                raise RuntimeError("native shaper override is outside the stock allowlist")
-            fit_arguments["shapers"] = NATIVE_SHAPER_ORDER
-        _best, candidates = native_helper.find_best_shaper(data, **fit_arguments)
         result["axis"] = axis.upper()
         result["validation"] = bool(validation)
-        result["native_candidates"] = [
-            _native_candidate(
-                item,
-                getattr(data, "freq_bins", None),
-                max_frequency,
-                design_damping_ratio,
-            )
-            for item in candidates
-        ]
+        if validation:
+            # Held-out captures are judged from their raw samples and QC only.
+            # Retain normalized display evidence, but do not repeat Klipper's
+            # candidate search after every reference/candidate motion.
+            result["native_candidates"] = []
+        else:
+            eventtime = self.printer.get_reactor().monotonic()
+            scv = self.printer.lookup_object("toolhead").get_status(eventtime)[
+                "square_corner_velocity"
+            ]
+            max_frequency = tester._get_max_calibration_freq()
+            fit_arguments = {
+                "damping_ratio": float(design_damping_ratio),
+                "max_smoothing": getattr(tester, "max_smoothing", None),
+                "scv": scv,
+                "max_freq": max_frequency,
+                "logger": lambda _message: None,
+            }
+            if native_shapers is not None:
+                fit_arguments["shapers"] = NATIVE_SHAPER_ORDER
+            if fitting_proof is not None:
+                fit_arguments["max_vibrations"] = fitting_proof["fraction"]
+            _best, candidates = native_helper.find_best_shaper(data, **fit_arguments)
+            result["native_candidates"] = [
+                _native_candidate(
+                    item,
+                    getattr(data, "freq_bins", None),
+                    max_frequency,
+                    design_damping_ratio,
+                )
+                for item in candidates
+            ]
         start_args = (
             self.printer.get_start_args() if hasattr(self.printer, "get_start_args") else {}
         )
@@ -345,6 +401,14 @@ class NativeResonanceCaptureProvider:
             },
             "native_design_damping_ratio": float(design_damping_ratio),
             "native_design_damping_source": "active_input_shaper_status",
+            "native_fit_max_vibrations": (
+                fitting_proof["fraction"] if fitting_proof is not None else None
+            ),
         }
+        if validation:
+            result["metadata"]["native_fitting_performed"] = False
+            result["metadata"][
+                "native_fitting_status"
+            ] = "skipped_held_out_validation"
         result.pop("native_data", None)
         return result

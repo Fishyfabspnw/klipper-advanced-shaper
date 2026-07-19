@@ -107,6 +107,11 @@ Leave `enable_experimental_generalized_mzv` false for `quality`, `balanced`, and
 `performance`. Set it to `True` only to opt into `experimental_mzv` or
 `adaptive_stock`; those profiles still perform an installed-Klipper capability
 probe and abstain before experimental motion on an unsupported build.
+They also require the installed native fitter to expose upstream
+`max_vibrations`; the plugin supplies the profile's finite fitting fraction
+(currently 10%) before native-family selection. This is not the held-out 10%
+attenuation-improvement gate. `quality`, `balanced`, and `performance` omit the
+parameter and retain their legacy native fitting behavior.
 
 With the printer idle, restart the actual Klipper service:
 

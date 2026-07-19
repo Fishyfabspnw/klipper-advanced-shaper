@@ -25,6 +25,15 @@ parameterized shaper names. A build without `get_shaper_cfg()` and
 `init_shaper()` support, or without a provable executor capacity, abstains
 safely.
 
+The two runtime experimental profiles also pass their finite
+`SelectionProfile.maximum_residual` value to upstream native fitting as
+`max_vibrations` (currently 10%). This affects the frequency fitted within each
+native family before downstream comparison; it is distinct from the held-out
+10% attenuation-improvement gate. The capability probe requires an explicit
+upstream `max_vibrations` parameter before motion, and no absent/`None` value
+is converted or forwarded. Ordinary profiles leave it omitted and preserve
+legacy fitting.
+
 ## What the experimental optimizer does
 
 The offline search varies pulse count, dimensionless pulse spacing, frequency,
@@ -78,8 +87,8 @@ configuration use the same canonical identifier.
 Current upstream also defines ZVD. ZVD is part of the exact-name allowlist, but
 the default native selection profiles are unchanged. The parameter schema is
 structured so a later, separately validated `ei(v_tol=...)` implementation can
-be added without opening arbitrary shaper arguments; EI parameters are not
-currently exposed.
+be added without opening arbitrary shaper arguments; `ei(v_tol=...)` is not
+runtime-exposed in this release.
 
 ## Non-inflating acceleration envelope
 
