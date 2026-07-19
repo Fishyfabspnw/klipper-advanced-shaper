@@ -18,6 +18,7 @@ belts, frame motion, toolhead play, sensor problems, or extrusion limits.
 | [Installation and maintenance](installation.md) | Install, configure, update, verify, and uninstall the plugin. |
 | [Reading reports](reports.md) | Find output files and interpret candidates, validation, and acceleration evidence. |
 | [Generalized MZV](experimental-generalized-mzv.md) | Understand the opt-in parameterized-MZV search and stock-Klipper capability gates. |
+| [Live evidence — 2026-07-19](live-evidence-2026-07-19.md) | Review the X/Y replay that established the stock-baseline-first no-upgrade gate. |
 | [Benchmark protocol](benchmarking.md) | Compare results without overstating model-derived acceleration. |
 
 The plugin does not modify Klipper's motion planner, shaper definitions,

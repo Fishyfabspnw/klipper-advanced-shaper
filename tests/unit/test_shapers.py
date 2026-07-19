@@ -31,6 +31,8 @@ def test_allowlisted_shaper_identifiers_are_canonical(raw, canonical):
         "mzv(n=4,t=1.5)",
         "mzv(n=4,t=8e-1)",
         "mzv(n=4,t=-.8)",
+        "mzv(n=4,t=.499999)",
+        "mzv(n=4,tau=.499999)",
         "mzv(n=4,t=.0000001)",
         "mzv(n=4,t=1.4999999)",
         "ei(v_tol=.05)",

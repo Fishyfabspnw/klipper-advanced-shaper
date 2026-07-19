@@ -59,6 +59,7 @@ PROFILES: Dict[str, SelectionProfile] = {
             "sensitivity": 0.05,
         },
         maximum_residual=0.10,
+        minimum_parameterized_smoothing_gain=0.05,
     ),
     "adaptive_stock": SelectionProfile(
         "adaptive_stock",
@@ -71,6 +72,7 @@ PROFILES: Dict[str, SelectionProfile] = {
             "sensitivity": 0.07,
         },
         maximum_residual=0.10,
+        minimum_parameterized_smoothing_gain=0.05,
     ),
 }
 
@@ -92,28 +94,45 @@ def pareto_frontier(candidates: Iterable[CandidateScore]) -> List[CandidateScore
     ]
 
 
+def eligible_candidates(
+    candidates: Iterable[CandidateScore], profile: SelectionProfile
+) -> List[CandidateScore]:
+    """Return candidates that pass the profile's common safety gates."""
+    return [
+        candidate
+        for candidate in candidates
+        if (
+            profile.maximum_residual is None
+            or candidate.residual_vibration <= profile.maximum_residual
+        )
+        and (
+            profile.maximum_cross_axis is None
+            or candidate.cross_axis_energy <= profile.maximum_cross_axis
+        )
+    ]
+
+
+def _candidate_key(candidate: CandidateScore) -> str:
+    return candidate.candidate_id or candidate.name
+
+
 def select_candidate(
     candidates: Iterable[CandidateScore], profile: SelectionProfile
 ) -> SelectionResult:
     values = list(candidates)
     if not values:
         return SelectionResult(None, [], {}, "no candidates")
-    if len({candidate.name for candidate in values}) != len(values):
-        return SelectionResult(None, pareto_frontier(values), {}, "candidate names must be unique")
-    eligible = [
-        c
-        for c in values
-        if (profile.maximum_residual is None or c.residual_vibration <= profile.maximum_residual)
-        and (
-            profile.maximum_cross_axis is None or c.cross_axis_energy <= profile.maximum_cross_axis
+    if len({_candidate_key(candidate) for candidate in values}) != len(values):
+        return SelectionResult(
+            None, pareto_frontier(values), {}, "candidate identities must be unique"
         )
-    ]
+    eligible = eligible_candidates(values, profile)
     if not eligible:
         return SelectionResult(
             None, pareto_frontier(values), {}, "no candidate passed profile safety gates"
         )
     frontier = pareto_frontier(eligible)
-    utilities = {candidate.name: 0.0 for candidate in frontier}
+    utilities = {_candidate_key(candidate): 0.0 for candidate in frontier}
     for metric, weight in profile.weights.items():
         raw = np.asarray([getattr(candidate, metric) for candidate in frontier], dtype=float)
         if not np.all(np.isfinite(raw)):
@@ -125,14 +144,14 @@ def select_candidate(
         if metric in MINIMIZE:
             normalized = 1.0 - normalized
         for candidate, score in zip(frontier, normalized):
-            utilities[candidate.name] += float(weight * score)
+            utilities[_candidate_key(candidate)] += float(weight * score)
     selected = max(
         frontier,
         key=lambda item: (
-            utilities[item.name],
+            utilities[_candidate_key(item)],
             -item.residual_vibration,
             item.max_accel,
-            item.name,
+            _candidate_key(item),
         ),
     )
     return SelectionResult(selected, frontier, utilities)

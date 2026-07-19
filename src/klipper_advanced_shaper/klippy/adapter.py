@@ -6,10 +6,12 @@ kept dependency-injected and therefore importable without Klipper installed.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import math
 import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence
@@ -137,6 +139,7 @@ class KlipperPrinterAdapter:
         self.capture_provider = self.printer.lookup_object("advanced_shaper_capture", None)
         self._shaper_defs_module = shaper_defs_module
         self._executor_pulse_limit = executor_pulse_limit
+        self._executor_single_pass_proof: Optional[Mapping[str, Any]] = None
         self._capture_native_shapers: Optional[Sequence[str]] = None
         self.last_capability: Optional[Mapping[str, Any]] = None
         self.last_live_python_pulse_proof: Optional[Mapping[str, Any]] = None
@@ -178,8 +181,98 @@ class KlipperPrinterAdapter:
         limit = int(match.group(1))
         if not 3 <= limit <= 10:
             raise RuntimeError("unsupported installed Klipper executor pulse capacity: %d" % limit)
+        if limit == 10:
+            single_pass_patterns = {
+                "p_ind_member": r"\bint\s+num_pulses\s*,\s*p_ind\s*;",
+                "p_ind_assignment": r"\bsp->p_ind\s*=\s*i\s*;",
+                "previous_move_loop": r"\bsp->p_ind\s*-\s*1",
+                "next_move_loop": r"\bi\s*=\s*sp->p_ind\s*;",
+            }
+            missing = [
+                name
+                for name, pattern in single_pass_patterns.items()
+                if re.search(pattern, content) is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "cannot prove installed Klipper 10-pulse single-pass executor: %s"
+                    % ", ".join(missing)
+                )
+            self._executor_single_pass_proof = {
+                "passed": True,
+                "feature": "ten_pulse_single_pass_executor",
+                "method": "read_only_c_source_signature",
+                "source_file": str(source),
+                "signatures": sorted(single_pass_patterns),
+            }
         self._executor_pulse_limit = limit
         return limit
+
+    def _prove_parameter_frequency_assignment(self) -> Mapping[str, Any]:
+        """Prove the installed Klipper contains the post-April frequency fix.
+
+        The initial parameterized-shaper implementation validated a requested
+        frequency but did not assign it to ``self.shaper_freq``.  Exact status
+        readback catches that after a temporary apply; this read-only source
+        proof moves the incompatibility failure ahead of experimental motion.
+        """
+        input_shaper = self.printer.lookup_object("input_shaper", None)
+        get_shapers = getattr(input_shaper, "get_shapers", None)
+        if get_shapers is None:
+            raise RuntimeError(
+                "installed Klipper cannot expose input-shaper parameter objects"
+            )
+        shapers = list(get_shapers())
+        if not shapers:
+            raise RuntimeError("installed Klipper exposes no input-shaper axes")
+        checked: dict[type[Any], dict[str, Any]] = {}
+        for shaper in shapers:
+            params = getattr(shaper, "params", None)
+            update = getattr(type(params), "update", None) if params is not None else None
+            if update is None:
+                raise RuntimeError(
+                    "installed Klipper input-shaper parameters lack update()"
+                )
+            parameter_type = type(params)
+            if parameter_type in checked:
+                continue
+            try:
+                source = textwrap.dedent(inspect.getsource(update))
+                tree = ast.parse(source)
+            except (OSError, TypeError, IndentationError, SyntaxError) as error:
+                raise RuntimeError(
+                    "cannot inspect installed Klipper input-shaper frequency update"
+                ) from error
+            fixed = any(
+                isinstance(node, (ast.Assign, ast.AnnAssign))
+                and isinstance(getattr(node, "value", None), ast.Name)
+                and node.value.id == "shaper_freq"
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    and target.attr == "shaper_freq"
+                    for target in (
+                        node.targets if isinstance(node, ast.Assign) else [node.target]
+                    )
+                )
+                for node in ast.walk(tree)
+            )
+            if not fixed:
+                raise RuntimeError(
+                    "installed Klipper lacks the SET_INPUT_SHAPER frequency-assignment fix"
+                )
+            checked[parameter_type] = {
+                "class": parameter_type.__name__,
+                "module": str(getattr(update, "__module__", "")),
+                "source_file": inspect.getsourcefile(update),
+            }
+        return {
+            "passed": True,
+            "feature": "set_input_shaper_frequency_assignment",
+            "method": "read_only_ast_source_proof",
+            "parameter_types": list(checked.values()),
+        }
 
     def preflight_experimental(
         self,
@@ -229,6 +322,7 @@ class KlipperPrinterAdapter:
                 "frequency_hz": frequency,
                 "damping_ratio": damping,
             }
+        frequency_assignment_proof = self._prove_parameter_frequency_assignment()
         upper_probe = min(executor_limit, 10)
         proofs = [
             prove_runtime_generalized_mzv(module, syntax)
@@ -253,9 +347,13 @@ class KlipperPrinterAdapter:
             "passed": failed is None,
             "family": "generalized_mzv",
             "executor_pulse_limit": executor_limit,
+            "executor_single_pass_proof": getattr(
+                self, "_executor_single_pass_proof", None
+            ),
             "proofs": proofs,
             "native_proof": native_proof,
             "exact_status_readback": exact_status,
+            "frequency_assignment_proof": frequency_assignment_proof,
             "reason": None if failed is None else failed.get("reason"),
         }
         if failed is not None:

@@ -25,6 +25,13 @@ parameterized shaper names. A build without `get_shaper_cfg()` and
 `init_shaper()` support, or without a provable executor capacity, abstains
 safely.
 
+For a ten-pulse build, preflight also checks the installed `kin_shaper.c`
+source signatures for the April 27 `p_ind` single-pass executor. A read-only AST
+check of the installed `InputShaperParams.update()` verifies the follow-up
+`self.shaper_freq = shaper_freq` assignment before the training sweep. Missing
+or uninspectable source fails closed; the later exact status readback remains a
+separate runtime check.
+
 The two runtime experimental profiles also pass their finite
 `SelectionProfile.maximum_residual` value to upstream native fitting as
 `max_vibrations` (currently 10%). This affects the frequency fitted within each
@@ -33,6 +40,30 @@ native family before downstream comparison; it is distinct from the held-out
 upstream `max_vibrations` parameter before motion, and no absent/`None` value
 is converted or forwarded. Ordinary profiles leave it omitted and preserve
 legacy fitting.
+
+## Use it as a second-stage challenger
+
+First run normal Klipper `SHAPER_CALIBRATE` or Shake&Tune, review its ordinary
+stock recommendation, apply it, and save it using that tool's documented
+workflow. After restart, confirm live Klipper status shows the intended stock
+type, frequency, and damping. Advanced Shaper snapshots those live values as
+the authoritative exact baseline; it does not infer the baseline from an old
+report.
+
+Then run `PROFILE=experimental_mzv`. Each parameterized candidate must use the
+same residual metric and eligibility gates as the stock candidates from that
+training capture. It must improve theoretical smoothing acceleration by at
+least 5% over **both** the exact active baseline and the best eligible
+same-capture stock candidate. The stronger comparator is recorded so one
+comparison cannot hide the other. It must also pass the exact-band theoretical
+screen and measured paired validation described below. If no candidate clears
+all stages, the truthful result is no upgrade. A theoretical-gate rejection
+causes no candidate `SET_INPUT_SHAPER` validation motion, and no rejected result
+becomes eligible for `APPLY` or `STAGE`.
+
+`PROFILE=adaptive_stock` may retain a stock candidate. `FAST_VALIDATION=1` is an
+exploratory screen with lower confidence; repeatable qualification uses the
+standard protocol with at least three training sweeps and three A/B pairs.
 
 ## What the experimental optimizer does
 
@@ -80,7 +111,10 @@ an arbitrary pulse vector or a project-specific shaper family.
 
 The accepted identifier language is deliberately smaller than Klipper's
 parser: `mzv(n=<3..10>,t=<safe decimal>)` or
-`mzv(n=<3..10>,tau=<positive decimal>)`. Arguments must be named; unknown,
+`mzv(n=<3..10>,tau=<safe decimal>)`. Both spacing arguments must be finite and
+at least `0.5`. Direct `t` must also satisfy the strict upstream upper bound
+`t < (n-1)/2`; `tau` is converted to upstream `t` and that result must satisfy
+the same bound. Arguments must be named; unknown,
 duplicate, positional, mixed `t`/`tau`, signed, exponent, NaN, and infinite
 values are rejected. Reports, runtime apply, rollback snapshots, and staged
 configuration use the same canonical identifier.
@@ -94,6 +128,14 @@ the default native selection profiles are unchanged. The parameter schema is
 structured so a later, separately validated `ei(v_tol=...)` implementation can
 be added without opening arbitrary shaper arguments; `ei(v_tol=...)` is not
 runtime-exposed in this release.
+
+### Dated evidence and limitation — 2026-07-19
+
+The current offline EI `v_tol` exploration produced zero parameterized EI
+candidates that survived the exact configured-baseline screen. Therefore
+`ei(v_tol=...)` remains research-only and is not accepted by the runtime parser,
+macro, apply path, or staging path. This is evidence against exposing the
+current experiment, not proof that no future EI parameterization can work.
 
 ## Theory screen and measured promotion are different
 
@@ -122,7 +164,7 @@ C executor structure.
 The experimental acceleration envelope is the minimum of the native-compatible
 smoothing/path-error bound, conservative repeatability and model-uncertainty
 bounds, and any available vibration-confidence, hardware, or print bound. A
-vibration-confidence bound participates only when a held-out resonance test
+vibration-confidence bound participates only when a held-out validation
 recorded the actual acceleration. Normalized vibration attenuation is not
 converted into an acceleration because that conversion would not be
 dimensionally justified.

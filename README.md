@@ -44,6 +44,29 @@ possible result is representable by stock `SET_INPUT_SHAPER`; arbitrary pulse
 vectors and project-specific shaper names are not accepted. The profile keeps
 mandatory held-out validation and never changes printer acceleration.
 
+## Recommended two-stage workflow
+
+1. Run Klipper's normal `SHAPER_CALIBRATE` or a normal Shake&Tune axis-shaper
+   calibration. Review it, apply it, and use `SAVE_CONFIG` through that tool's
+   documented workflow.
+2. Restart as required and confirm the ordinary stock result is active. The
+   shaper type, frequency, and damping in live Klipper status are the
+   authoritative configured baseline for Advanced Shaper.
+3. Run `PROFILE=experimental_mzv` as a challenger. A parameterized MZV must show
+   at least 5% more **theoretical smoothing acceleration** than both that exact
+   active baseline and the best eligible stock candidate fitted from the same
+   training capture. All candidates use the same residual metric and gates.
+4. The challenger must then pass the exact configured-baseline spectral band
+   screen and mandatory paired held-out ring-down validation. If either
+   theoretical gate rejects it, no candidate `SET_INPUT_SHAPER` validation
+   motion occurs and the report says no upgrade. A later measured rejection
+   also says no upgrade. Neither outcome becomes eligible for `APPLY` or
+   `STAGE`.
+
+`adaptive_stock` uses the same strict experimental safety boundary, but may
+retain a stock candidate. Fast validation is exploratory; use the standard
+protocol with at least three repeats for repeatable qualification.
+
 ## Quick install
 
 Requirements: a working Klipper host, Python 3.9–3.11, Git, a configured
@@ -127,7 +150,7 @@ calibration parameters:
 | Parameter | Accepted values | Default | Meaning and restrictions |
 | --- | --- | --- | --- |
 | `AXIS` | `X`, `Y`, or `ALL` | `ALL` | Calibrates one axis or X followed by Y. Every requested axis must be homed. |
-| `PROFILE` | `quality`, `balanced`, `performance`, `experimental_mzv`, or `adaptive_stock` | `balanced` | The first three retain the ordinary native analysis path. `experimental_mzv` searches only generalized MZV. `adaptive_stock` compares all six native families with generalized MZV. The last two require the explicit config opt-in and mandatory held-out validation. |
+| `PROFILE` | `quality`, `balanced`, `performance`, `experimental_mzv`, or `adaptive_stock` | `balanced` | The first three retain the ordinary native analysis path. `experimental_mzv` treats generalized MZV only as a challenger to the active configured baseline and same-capture stock candidates. `adaptive_stock` may retain one of the six stock families. The last two require explicit opt-in and mandatory held-out validation. |
 | `REPEATS` | Integer `1` through `20` | `3` | Unshaped `TEST_RESONANCES` training sweeps. Experimental profiles require at least three. Fast validation uses one training sweep and exactly two paired transient captures per condition. |
 | `VALIDATE` | `0` or `1` | `1` | When `1`, runs the mandatory finite-reversal, raw ring-down A/B validation for experimental profiles. It is not another resonance sweep. A `0` run is not physical performance evidence. |
 | `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal from `20` through `350` | `CONFIG` | Free numeric excitation control in mm/s^2/Hz—not presets. `CONFIG` inherits `[resonance_tester]`. The resolved value must pass the dynamic motion-budget check. |
@@ -288,6 +311,13 @@ and damping before validation can continue. Experimental validation additionally
 checks the live Klippy axis state is enabled and that its `n/A/T` pulse arrays
 match the installed `shaper_defs.init_shaper` result on active kinematics. This
 is still not a readback of Klipper's private C executor structure.
+
+Canonical generalized MZV accepts only `n=3..10` and exactly one of `t` or
+`tau`. Both spacing forms must be finite and at least `0.5`. Direct `t` also
+has the strict upstream upper bound `t < (n-1)/2`; `tau` is converted to `t`
+and the converted value must satisfy the same upstream constraint. Unknown,
+duplicate, positional, mixed, signed, exponent, and non-finite arguments fail
+closed.
 
 A candidate rejected by held-out validation is never available to `APPLY` or
 `STAGE`. After the original printer state has been restored successfully, its

@@ -8,6 +8,8 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from klipper_advanced_shaper.shapers import parse_shaper_identifier
+
 from .adapter import (
     KlipperPrinterAdapter,
     PrinterAdapter,
@@ -121,6 +123,155 @@ def _assert_models_match_selections(
                 "%s-axis installed-Klipper %s model does not exactly match selection"
                 % (selection.axis, role)
             )
+
+
+def _reported_candidate_identity(candidate: Mapping[str, Any], axis: str) -> str:
+    try:
+        identifier = parse_shaper_identifier(str(candidate["name"]))
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "%s-axis experimental candidate identity is malformed" % axis
+        ) from error
+    identity = candidate.get("candidate_id")
+    if identifier.parameterized:
+        if not isinstance(identity, str) or not identity:
+            raise RuntimeError("%s-axis parameterized candidate ID is missing" % axis)
+        try:
+            prefix = identifier.canonical + "@frequency_hz="
+            if not identity.startswith(prefix):
+                raise ValueError("identifier prefix mismatch")
+            frequency_text, damping_text = identity[len(prefix) :].split(
+                ",damping_ratio=", 1
+            )
+            frequency = float(frequency_text)
+            damping = float(damping_text)
+            metadata = candidate.get("metadata")
+            candidate_damping = (
+                metadata.get("design_damping_ratio")
+                if isinstance(metadata, Mapping)
+                else candidate.get("damping_ratio")
+            )
+            expected = "%s@frequency_hz=%.17g,damping_ratio=%.17g" % (
+                identifier.canonical,
+                frequency,
+                damping,
+            )
+            if (
+                identity != expected
+                or not math.isfinite(frequency)
+                or frequency <= 0.0
+                or not math.isfinite(damping)
+                or not 0.0 <= damping < 1.0
+                or float(candidate["frequency"]) != frequency
+                or float(candidate_damping) != damping
+            ):
+                raise ValueError("candidate identity mismatch")
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "%s-axis parameterized candidate ID is malformed" % axis
+            ) from error
+        return identity
+    if identity is None:
+        return identifier.canonical
+    if identity != identifier.canonical:
+        raise RuntimeError("%s-axis native candidate identity is malformed" % axis)
+    return identity
+
+
+def _selection_candidate_ids(
+    report: Mapping[str, Any],
+    selections: Sequence[ShaperSelection],
+) -> dict[str, str]:
+    """Return exact analysis identities after strict per-axis report checks."""
+    raw_selections = report.get("selections")
+    axes_report = report.get("axes")
+    if not isinstance(raw_selections, Sequence) or not isinstance(axes_report, Mapping):
+        raise RuntimeError("experimental analysis lacks candidate identity evidence")
+    raw_by_axis: dict[str, Mapping[str, Any]] = {}
+    for raw in raw_selections:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("experimental selection identity is malformed")
+        axis = str(raw.get("axis", "")).upper()
+        if axis in raw_by_axis:
+            raise RuntimeError("experimental selection candidate IDs are duplicated")
+        raw_by_axis[axis] = raw
+    if set(raw_by_axis) != {selection.axis for selection in selections}:
+        raise RuntimeError("experimental selection candidate IDs are incomplete")
+
+    result: dict[str, str] = {}
+    for selection in selections:
+        raw = raw_by_axis[selection.axis]
+        candidate_id = raw.get("candidate_id")
+        axis_report = axes_report.get(selection.axis)
+        if not isinstance(candidate_id, str) or not candidate_id or not isinstance(
+            axis_report, Mapping
+        ):
+            raise RuntimeError(
+                "%s-axis experimental candidate ID is missing or malformed"
+                % selection.axis
+            )
+        candidates = axis_report.get("candidates")
+        if not isinstance(candidates, Sequence):
+            raise RuntimeError(
+                "%s-axis experimental candidate identities are missing"
+                % selection.axis
+            )
+        candidate_rows: dict[str, Mapping[str, Any]] = {}
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                raise RuntimeError(
+                    "%s-axis experimental candidate identity is malformed"
+                    % selection.axis
+                )
+            identity = _reported_candidate_identity(candidate, selection.axis)
+            if identity in candidate_rows:
+                raise RuntimeError(
+                    "%s-axis experimental candidate IDs are missing or duplicated"
+                    % selection.axis
+                )
+            candidate_rows[identity] = candidate
+        selected_identity = axis_report.get("selected_candidate_id")
+        selected_row = candidate_rows.get(candidate_id)
+        if selected_identity != candidate_id or selected_row is None:
+            raise RuntimeError(
+                "%s-axis selected candidate ID does not exactly match analysis evidence"
+                % selection.axis
+            )
+        try:
+            selected_identifier = parse_shaper_identifier(str(selected_row["name"]))
+            selected_metadata = selected_row.get("metadata")
+            if selected_identifier.parameterized and (
+                not isinstance(selected_metadata, Mapping)
+                or "design_damping_ratio" not in selected_metadata
+            ):
+                raise ValueError(
+                    "parameterized candidate lacks its analyzed design damping"
+                )
+            candidate_damping = (
+                selected_metadata["design_damping_ratio"]
+                if isinstance(selected_metadata, Mapping)
+                and "design_damping_ratio" in selected_metadata
+                else raw["damping_ratio"]
+            )
+            candidate_selection = selection_from_mapping(
+                {
+                    "axis": selection.axis,
+                    "shaper_type": selected_row["name"],
+                    "frequency_hz": selected_row["frequency"],
+                    "damping_ratio": candidate_damping,
+                }
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "%s-axis selected candidate identity is malformed" % selection.axis
+            ) from error
+        if candidate_selection != selection:
+            raise RuntimeError(
+                "%s-axis selected candidate ID does not exactly match selection"
+                % selection.axis
+            )
+        result[selection.axis] = candidate_id
+    return result
 
 
 def _require_transient_preflight(
@@ -523,56 +674,158 @@ class AdvancedInputShaper:
                     )
 
             self.machine.transition(CalibrationState.ANALYSIS)
-            self.machine.checkpoint()
-            report = self._invoke(
-                self.analyzer,
-                captures=captures,
-                axes=normalized_axes,
-                profile=profile,
-                snapshot=analysis_snapshot,
-                experimental_mode=experimental_mode,
-                executor_pulse_limit=executor_pulse_limit,
-                peak_lock=peak_lock_enabled,
-            )
-            if report.get("abstain"):
-                raise RuntimeError("analysis abstained: %s" % report.get("reason", "quality gate"))
-            for axis in normalized_axes:
-                target = self.minimum_max_accel[axis]
-                details = report.get("axes", {}).get(axis, {})
-                selected_name = details.get("selected")
-                selected = next(
-                    (
-                        item
-                        for item in details.get("candidates", [])
-                        if item.get("name") == selected_name
-                    ),
-                    None,
-                )
-                if target and (selected is None or float(selected["max_accel"]) <= target):
-                    raise RuntimeError(
-                        "%s candidate did not exceed required %.0f mm/s^2" % (axis, target)
+            excluded_candidate_ids: dict[str, list[str]] = {
+                axis: [] for axis in normalized_axes
+            }
+            screen_attempts: list[dict[str, Any]] = []
+            candidate_universe: Optional[dict[str, frozenset[str]]] = None
+            while True:
+                self.machine.checkpoint()
+                analysis_arguments: dict[str, Any] = {
+                    "captures": captures,
+                    "axes": normalized_axes,
+                    "profile": profile,
+                    "snapshot": analysis_snapshot,
+                    "experimental_mode": experimental_mode,
+                    "executor_pulse_limit": executor_pulse_limit,
+                    "peak_lock": peak_lock_enabled,
+                }
+                if experimental_mode:
+                    analysis_arguments.update(
+                        {
+                            "reference_models": reference_models,
+                            "excluded_candidate_ids": {
+                                axis: list(values)
+                                for axis, values in excluded_candidate_ids.items()
+                                if values
+                            },
+                        }
                     )
-            selections = tuple(selection_from_mapping(value) for value in report["selections"])
-            selected_axes = {item.axis for item in selections}
-            if selected_axes != set(normalized_axes) or len(selections) != len(normalized_axes):
-                raise RuntimeError("analysis did not return exactly one selection per axis")
-            has_parameterized = any(item.parameterized for item in selections)
-            if has_parameterized and not experimental_mode:
-                raise RuntimeError(
-                    "analysis returned a parameterized shaper outside experimental mode"
+                report = self._invoke(self.analyzer, **analysis_arguments)
+                if not isinstance(report, Mapping):
+                    raise RuntimeError("analysis returned malformed evidence")
+                if report.get("abstain"):
+                    abstention_error = RuntimeError(
+                        "analysis abstained: %s"
+                        % report.get("reason", "quality gate")
+                    )
+                    if experimental_mode:
+                        report = dict(report)
+                        report.update(
+                            {
+                                "attempt_id": attempt_id,
+                                "status": "rejected",
+                                "reason": str(abstention_error),
+                                "runtime_capability": runtime_capability,
+                                "excitation_preflight": excitation_preflight,
+                                "validation_protocol": dict(validation_protocol),
+                                "excluded_candidate_ids": {
+                                    axis: list(values)
+                                    for axis, values in excluded_candidate_ids.items()
+                                },
+                                "theoretical_spectral_screen_attempts": list(
+                                    screen_attempts
+                                ),
+                            }
+                        )
+                        rejection_report = report
+                        rejection_raw_groups = {"training": captures}
+                    raise abstention_error
+                report = dict(report)
+                try:
+                    selections = tuple(
+                        selection_from_mapping(value) for value in report["selections"]
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise RuntimeError("analysis returned malformed selections") from error
+                selected_axes = {item.axis for item in selections}
+                if (
+                    selected_axes != set(normalized_axes)
+                    or len(selections) != len(normalized_axes)
+                ):
+                    raise RuntimeError(
+                        "analysis did not return exactly one selection per axis"
+                    )
+                candidate_ids = (
+                    _selection_candidate_ids(report, selections)
+                    if experimental_mode
+                    else {}
                 )
-            if has_parameterized and not validate:
-                raise RuntimeError("parameterized shapers require held-out validation")
-            if has_parameterized:
-                capability_probe = getattr(self.adapter, "preflight_experimental", None)
-                if capability_probe is None:
-                    raise RuntimeError("adapter cannot prove exact parameterized selection")
-                runtime_capability = capability_probe(
-                    selections, max_vibrations=max_vibrations
-                )
-                executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
-            report = dict(report)
-            if experimental_mode:
+                if experimental_mode:
+                    current_universe = {}
+                    for axis in normalized_axes:
+                        candidates = report["axes"][axis]["candidates"]
+                        current_universe[axis] = frozenset(
+                            _reported_candidate_identity(item, axis)
+                            for item in candidates
+                            if isinstance(item, Mapping)
+                        )
+                    if candidate_universe is None:
+                        candidate_universe = current_universe
+                    elif current_universe != candidate_universe:
+                        raise RuntimeError(
+                            "offline retry changed the candidate identity universe"
+                        )
+                    for axis, candidate_id in candidate_ids.items():
+                        if candidate_id in excluded_candidate_ids[axis]:
+                            raise RuntimeError(
+                                "%s-axis offline retry reselected an excluded candidate ID"
+                                % axis
+                            )
+                for axis in normalized_axes:
+                    target = self.minimum_max_accel[axis]
+                    details = report.get("axes", {}).get(axis, {})
+                    selected_identity = (
+                        candidate_ids.get(axis)
+                        if experimental_mode
+                        else details.get("selected")
+                    )
+                    selected = next(
+                        (
+                            item
+                            for item in details.get("candidates", [])
+                            if (
+                                _reported_candidate_identity(item, axis)
+                                if experimental_mode
+                                else item.get("name")
+                            )
+                            == selected_identity
+                        ),
+                        None,
+                    )
+                    if target and (
+                        selected is None or float(selected["max_accel"]) <= target
+                    ):
+                        raise RuntimeError(
+                            "%s candidate did not exceed required %.0f mm/s^2"
+                            % (axis, target)
+                        )
+                has_parameterized = any(item.parameterized for item in selections)
+                if has_parameterized and not experimental_mode:
+                    raise RuntimeError(
+                        "analysis returned a parameterized shaper outside experimental mode"
+                    )
+                if has_parameterized and not validate:
+                    raise RuntimeError(
+                        "parameterized shapers require held-out validation"
+                    )
+                if has_parameterized:
+                    capability_probe = getattr(
+                        self.adapter, "preflight_experimental", None
+                    )
+                    if capability_probe is None:
+                        raise RuntimeError(
+                            "adapter cannot prove exact parameterized selection"
+                        )
+                    runtime_capability = capability_probe(
+                        selections, max_vibrations=max_vibrations
+                    )
+                    executor_pulse_limit = int(
+                        runtime_capability["executor_pulse_limit"]
+                    )
+                if not experimental_mode:
+                    break
+
                 assert reference_models is not None
                 model_builder = getattr(self.adapter, "build_shaper_models", None)
                 if model_builder is None:
@@ -590,14 +843,46 @@ class AdvancedInputShaper:
                     reference_models=reference_models,
                     candidate_models=candidate_models,
                 )
-                if not isinstance(screen, Mapping) or screen.get("passed") not in {
-                    True,
-                    False,
-                }:
+                screen_axes = screen.get("axes") if isinstance(screen, Mapping) else None
+                if (
+                    not isinstance(screen, Mapping)
+                    or screen.get("passed") not in {True, False}
+                    or not isinstance(screen_axes, Mapping)
+                    or set(screen_axes) != set(normalized_axes)
+                    or any(
+                        not isinstance(screen_axes[axis], Mapping)
+                        or screen_axes[axis].get("passed") not in {True, False}
+                        for axis in normalized_axes
+                    )
+                    or bool(screen["passed"])
+                    != all(bool(screen_axes[axis]["passed"]) for axis in normalized_axes)
+                ):
                     raise RuntimeError(
                         "theoretical spectral non-regression screen returned malformed evidence"
                     )
+                model_proofs = {
+                    item["axis"]: item
+                    for item in _model_proof_summary(candidate_models)
+                }
+                screen_attempts.append(
+                    {
+                        "attempt_index": len(screen_attempts) + 1,
+                        "candidates": [
+                            {
+                                "axis": selection.axis,
+                                "candidate_id": candidate_ids[selection.axis],
+                                "selection": selection.to_mapping(),
+                                "model_proof": model_proofs[selection.axis],
+                            }
+                            for selection in selections
+                        ],
+                        "screen": dict(screen),
+                    }
+                )
                 report["theoretical_spectral_non_regression"] = dict(screen)
+                report["theoretical_spectral_screen_attempts"] = list(
+                    screen_attempts
+                )
                 capability_details = dict(runtime_capability or {})
                 capability_details["configured_reference_model_proofs"] = (
                     _model_proof_summary(reference_models)
@@ -609,11 +894,24 @@ class AdvancedInputShaper:
                 validation_protocol["theoretical_spectral_non_regression"] = {
                     "required": True,
                     "passed": bool(screen["passed"]),
+                    "attempt_count": len(screen_attempts),
                     "evidence_level": "theoretical_preflight_screen",
                     "held_out_validation_still_required": True,
                 }
                 self.current_validation_protocol = dict(validation_protocol)
-                if not screen["passed"]:
+                if screen["passed"]:
+                    break
+
+                failed_axes = [
+                    axis
+                    for axis in normalized_axes
+                    if screen_axes[axis]["passed"] is False
+                ]
+                selections_by_axis = {item.axis: item for item in selections}
+                if any(
+                    not selections_by_axis[axis].parameterized
+                    for axis in failed_axes
+                ):
                     rejection_error = RuntimeError(
                         "candidate failed theoretical spectral non-regression screen: %s"
                         % screen.get("reason", "meaningful-band regression")
@@ -626,11 +924,22 @@ class AdvancedInputShaper:
                             "attempt_id": attempt_id,
                             "status": "rejected",
                             "reason": str(rejection_error),
+                            "excluded_candidate_ids": {
+                                axis: list(values)
+                                for axis, values in excluded_candidate_ids.items()
+                            },
                         }
                     )
                     rejection_report = report
                     rejection_raw_groups = {"training": captures}
                     raise rejection_error
+                for axis in failed_axes:
+                    candidate_id = candidate_ids[axis]
+                    if candidate_id in excluded_candidate_ids[axis]:
+                        raise RuntimeError(
+                            "%s-axis theoretical screen retry made no progress" % axis
+                        )
+                    excluded_candidate_ids[axis].append(candidate_id)
             report["runtime_capability"] = runtime_capability
             report["excitation_preflight"] = excitation_preflight
             report["validation_protocol"] = dict(validation_protocol)

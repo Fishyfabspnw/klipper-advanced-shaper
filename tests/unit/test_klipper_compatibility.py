@@ -1124,6 +1124,62 @@ def test_experimental_preflight_rejects_rounded_only_shaper_status():
         adapter.preflight_experimental()
 
 
+def test_frequency_assignment_source_preflight_accepts_fixed_klipper():
+    class FixedParams:
+        def update(self, _gcmd):
+            shaper_freq = 72.25
+            self.shaper_freq = shaper_freq
+
+    class Axis:
+        params = FixedParams()
+
+    class InputShaper:
+        @staticmethod
+        def get_shapers():
+            return [Axis(), Axis()]
+
+    class Printer:
+        @staticmethod
+        def lookup_object(name, default=None):
+            return InputShaper() if name == "input_shaper" else default
+
+    adapter = KlipperPrinterAdapter.__new__(KlipperPrinterAdapter)
+    adapter.printer = Printer()
+
+    proof = adapter._prove_parameter_frequency_assignment()
+
+    assert proof["passed"] is True
+    assert proof["feature"] == "set_input_shaper_frequency_assignment"
+    assert proof["method"] == "read_only_ast_source_proof"
+    assert len(proof["parameter_types"]) == 1
+
+
+def test_frequency_assignment_source_preflight_rejects_buggy_klipper():
+    class BuggyParams:
+        def update(self, _gcmd):
+            shaper_freq = 72.25
+            self.damping_ratio = shaper_freq
+
+    class Axis:
+        params = BuggyParams()
+
+    class InputShaper:
+        @staticmethod
+        def get_shapers():
+            return [Axis()]
+
+    class Printer:
+        @staticmethod
+        def lookup_object(name, default=None):
+            return InputShaper() if name == "input_shaper" else default
+
+    adapter = KlipperPrinterAdapter.__new__(KlipperPrinterAdapter)
+    adapter.printer = Printer()
+
+    with pytest.raises(RuntimeError, match="frequency-assignment fix"):
+        adapter._prove_parameter_frequency_assignment()
+
+
 def test_installed_executor_capacity_is_discovered_and_enforced(tmp_path):
     extras = tmp_path / "klippy" / "extras"
     chelper = tmp_path / "klippy" / "chelper"
@@ -1142,6 +1198,26 @@ def test_installed_executor_capacity_is_discovered_and_enforced(tmp_path):
 
     with pytest.raises(RuntimeError, match="supports 5 pulses"):
         adapter._prove_selection(ShaperSelection("mzv(n=6,t=.8)", 70.0, "X", 0.04))
+
+
+def test_ten_pulse_executor_requires_april_single_pass_source_signatures(tmp_path):
+    extras = tmp_path / "klippy" / "extras"
+    chelper = tmp_path / "klippy" / "chelper"
+    extras.mkdir(parents=True)
+    chelper.mkdir()
+    module_path = extras / "shaper_defs.py"
+    module_path.write_text("# fixture\n", encoding="utf-8")
+    (chelper / "kin_shaper.c").write_text(
+        "struct shaper_pulses { int num_pulses; double pulses[10]; };\n",
+        encoding="utf-8",
+    )
+    module = type("InstalledDefs", (), {"__file__": str(module_path)})
+    adapter = KlipperPrinterAdapter.__new__(KlipperPrinterAdapter)
+    adapter._shaper_defs_module = module
+    adapter._executor_pulse_limit = None
+
+    with pytest.raises(RuntimeError, match="single-pass executor"):
+        adapter._get_executor_pulse_limit()
 
 
 def test_applied_parameterized_status_requires_exact_axis_name_frequency_and_damping():

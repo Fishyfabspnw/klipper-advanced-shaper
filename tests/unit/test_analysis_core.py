@@ -118,6 +118,36 @@ def test_selection_abstains_when_safety_gate_fails():
     assert result.abstention_reason
 
 
+def test_selection_distinguishes_runtime_variants_with_same_shaper_identifier():
+    lower = CandidateScore(
+        "mzv(n=3,t=0.700000)",
+        70.0,
+        0.05,
+        0.10,
+        12000.0,
+        0.03,
+        0.04,
+        0.03,
+        candidate_id="mzv(n=3,t=0.700000)@frequency_hz=70,damping_ratio=0.08",
+    )
+    higher = CandidateScore(
+        "mzv(n=3,t=0.700000)",
+        80.0,
+        0.05,
+        0.10,
+        12000.0,
+        0.03,
+        0.04,
+        0.03,
+        candidate_id="mzv(n=3,t=0.700000)@frequency_hz=80,damping_ratio=0.08",
+    )
+
+    result = select_candidate([lower, higher], PROFILES["performance"])
+
+    assert result.selected == higher
+    assert set(result.utilities) == {lower.candidate_id, higher.candidate_id}
+
+
 def test_held_out_attenuation_bootstrap_supports_lower_confidence_two_repeats():
     low, high = attenuation_improvement_ci(
         np.array([10, 11, 9, 10]), np.array([7, 7.7, 6.3, 7]), seed=1

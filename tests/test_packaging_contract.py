@@ -113,6 +113,13 @@ def test_readme_documents_protocol_and_smoke_test_boundaries():
     assert "not a readback of Klipper's private C executor structure" in normalized
     assert "ADXL345, LIS2DW, and LIS3DH" in normalized
     assert "abstain before transient motion" in normalized
+    assert "normal `SHAPER_CALIBRATE` or a normal Shake&Tune" in normalized
+    assert "authoritative configured baseline" in normalized
+    assert "at least 5%" in normalized
+    assert "best eligible stock candidate" in normalized
+    assert "report says no upgrade" in normalized
+    assert "Fast validation is exploratory" in normalized
+    assert "strict upstream upper bound `t < (n-1)/2`" in normalized
 
 
 def test_readme_has_complete_calibration_parameter_reference():

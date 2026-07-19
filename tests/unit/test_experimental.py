@@ -25,6 +25,12 @@ def test_generalized_mzv_is_positive_normalized_and_notches_design_mode():
     assert response[0] < 1e-7
 
 
+@pytest.mark.parametrize("spacing", [0.0, 0.499999, 1.49999995])
+def test_generalized_mzv_rejects_values_outside_upstream_spacing_domain(spacing):
+    with pytest.raises(ValueError, match="upstream"):
+        generalized_mzv_pulses(4, spacing, 60.0, 0.08)
+
+
 def test_generalized_mzv_matches_pinned_upstream_pulse_definition():
     # Frozen from Klipper shaper_defs.py at 7046bd00ef5c30dec6febc724f8d22967433c45c.
     amplitudes, times = generalized_mzv_pulses(4, 0.8, 72.0, 0.04)

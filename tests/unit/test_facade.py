@@ -62,9 +62,49 @@ def _capture(axis="X", scale=1.0, repeat=0, cross_scale=0.0, display_data=True):
         for candidate in candidates:
             candidate["native_frequency_response"] = {
                 "frequency_hz": response_frequency.tolist(),
-                "response_ratio": np.exp(-response_frequency / candidate["frequency"]).tolist(),
+                "response_ratio": np.full(response_frequency.shape, 0.05).tolist(),
             }
     return result
+
+
+def _experimental_snapshot(*, frequency=74.2, damping=0.09, scv=7.0):
+    return SimpleNamespace(
+        square_corner_velocity=scv,
+        shaper_type_x="mzv",
+        shaper_freq_x=frequency,
+        damping_ratio_x=damping,
+    )
+
+
+def _configured_reference_models(snapshot, *, pulse_times=None):
+    frequency = float(snapshot.shaper_freq_x)
+    times = pulse_times or [0.0, 0.5 / frequency, 1.0 / frequency]
+    return {
+        "X": {
+            "axis": "X",
+            "shaper_type": snapshot.shaper_type_x,
+            "frequency_hz": frequency,
+            "design_damping_ratio": float(snapshot.damping_ratio_x),
+            "pulse_amplitudes_normalized": [0.25, 0.5, 0.25],
+            "pulse_times_s": times,
+            "pulse_count": 3,
+            "executor_pulse_limit": 10,
+            "api_signature_verified": True,
+            "source": "installed_klipper_shaper_defs.init_shaper",
+            "source_module": "shaper_defs",
+            "source_file": "/opt/klipper/klippy/extras/shaper_defs.py",
+            "theoretical_model_only": True,
+            "live_c_executor_readback": False,
+        }
+    }
+
+
+def _experimental_arguments(*, frequency=74.2, damping=0.09, scv=7.0):
+    snapshot = _experimental_snapshot(frequency=frequency, damping=damping, scv=scv)
+    return {
+        "snapshot": snapshot,
+        "reference_models": _configured_reference_models(snapshot),
+    }
 
 
 def test_facade_selects_native_candidate_and_reports_modes():
@@ -241,8 +281,8 @@ def test_finite_ringdown_rejects_catastrophic_new_frequency_regression():
         captures=training,
         axes=("X",),
         profile="experimental_mzv",
-        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
         experimental_mode=True,
+        **_experimental_arguments(damping=0.08),
     )
     reference = [_capture(scale=1.0, repeat=index) for index in range(3)]
     candidate = [_capture(scale=0.5, repeat=index) for index in range(3)]
@@ -281,8 +321,8 @@ def test_finite_ringdown_rejects_mismatched_paired_window_duration():
         captures=training,
         axes=("X",),
         profile="experimental_mzv",
-        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
         experimental_mode=True,
+        **_experimental_arguments(damping=0.08),
     )
     reference = [_capture(scale=1.0, repeat=index) for index in range(2)]
     candidate = [_capture(scale=0.75, repeat=index) for index in range(2)]
@@ -363,8 +403,8 @@ def test_experimental_profile_promotes_generalized_mzv_with_measured_damping():
         captures={"X": [_capture(repeat=index) for index in range(3)]},
         axes=("X",),
         profile="experimental_mzv",
-        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.09),
         experimental_mode=True,
+        **_experimental_arguments(),
     )
     assert not report.get("abstain")
     details = report["axes"]["X"]
@@ -385,8 +425,8 @@ def test_adaptive_stock_compares_native_and_parameterized_stock_candidates():
         captures={"X": [_capture(repeat=index) for index in range(3)]},
         axes=("X",),
         profile="adaptive_stock",
-        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.09),
         experimental_mode=True,
+        **_experimental_arguments(),
     )
 
     assert not report.get("abstain")
@@ -466,9 +506,9 @@ def test_experimental_optimizer_respects_installed_executor_pulse_limit():
         captures={"X": [_capture(repeat=index) for index in range(3)]},
         axes=("X",),
         profile="experimental_mzv",
-        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.04),
         experimental_mode=True,
         executor_pulse_limit=5,
+        **_experimental_arguments(damping=0.04),
     )
     assert not report.get("abstain")
     parameterized = [
@@ -485,9 +525,9 @@ def test_experimental_peak_lock_uses_highest_psd_mode_exactly():
         captures={"X": [_capture(repeat=index) for index in range(3)]},
         axes=("X",),
         profile="experimental_mzv",
-        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.04),
         experimental_mode=True,
         peak_lock=True,
+        **_experimental_arguments(damping=0.04),
     )
     assert not report.get("abstain")
     details = report["axes"]["X"]
@@ -500,3 +540,218 @@ def test_experimental_peak_lock_uses_highest_psd_mode_exactly():
     ]
     assert parameterized
     assert {item["frequency"] for item in parameterized} == {target}
+
+
+def test_experimental_training_requires_exact_verified_configured_reference():
+    report = analyze_calibration(
+        captures={"X": [_capture(repeat=index) for index in range(3)]},
+        axes=("X",),
+        profile="experimental_mzv",
+        snapshot=_experimental_snapshot(),
+        experimental_mode=True,
+    )
+
+    assert report["abstain"] is True
+    assert "exact verified configured reference models" in report["reason"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("source", "copied_test_model", "installed-source checks"),
+        ("frequency_hz", 75.0, "installed-source checks"),
+        ("api_signature_verified", False, "installed-source checks"),
+    ],
+)
+def test_experimental_reference_model_must_match_snapshot_and_installed_source(
+    field, value, message
+):
+    arguments = _experimental_arguments()
+    arguments["reference_models"]["X"][field] = value
+    report = analyze_calibration(
+        captures={"X": [_capture(repeat=index) for index in range(3)]},
+        axes=("X",),
+        profile="experimental_mzv",
+        experimental_mode=True,
+        **arguments,
+    )
+
+    assert report["abstain"] is True
+    assert message in report["reason"]
+
+
+def test_experimental_reference_model_requires_strictly_increasing_pulse_times():
+    arguments = _experimental_arguments()
+    arguments["reference_models"]["X"]["pulse_times_s"] = [0.0, 0.0, 0.01]
+    report = analyze_calibration(
+        captures={"X": [_capture(repeat=index) for index in range(3)]},
+        axes=("X",),
+        profile="experimental_mzv",
+        experimental_mode=True,
+        **arguments,
+    )
+
+    assert report["abstain"] is True
+    assert "installed-source checks" in report["reason"]
+
+
+def test_second_stage_reports_exact_comparators_gain_and_truthful_evidence_level():
+    report = analyze_calibration(
+        captures={"X": [_capture(repeat=index) for index in range(3)]},
+        axes=("X",),
+        profile="experimental_mzv",
+        experimental_mode=True,
+        **_experimental_arguments(),
+    )
+
+    evidence = report["axes"]["X"]["second_stage_eligibility"]
+    assert evidence["minimum_required_gain_fraction"] == 0.05
+    assert evidence["configured_reference"]["name"] == "mzv"
+    assert evidence["configured_reference"]["api_signature_verified"] is True
+    assert evidence["configured_reference"][
+        "model_identity_verified_against_snapshot"
+    ] is True
+    assert evidence["best_eligible_stock_candidate"]["name"] == "mzv"
+    assert evidence["stronger_comparator"]["kind"] == (
+        "best_eligible_stock_candidate_from_same_capture"
+    )
+    selected = report["selections"][0]["candidate_id"]
+    selected_evidence = next(
+        item for item in evidence["parameterized_candidates"] if item["candidate_id"] == selected
+    )
+    assert selected_evidence["eligible"] is True
+    assert selected_evidence["gain_fraction_over_stronger_comparator"] >= 0.05
+    assert evidence["evidence_level"] == "theoretical_model_only"
+    assert evidence["physical_acceleration_claim"] is False
+    assert evidence["resonance_validation_still_required"] is True
+    assert evidence["print_validation_not_performed"] is True
+
+
+def test_experimental_mzv_abstains_when_no_parameterized_candidate_beats_stock():
+    captures = {"X": [_capture(repeat=index) for index in range(3)]}
+    for capture in captures["X"]:
+        for candidate in capture["native_candidates"]:
+            candidate["max_accel"] = 100_000.0
+    report = analyze_calibration(
+        captures=captures,
+        axes=("X",),
+        profile="experimental_mzv",
+        experimental_mode=True,
+        **_experimental_arguments(),
+    )
+
+    assert report["abstain"] is True
+    assert "required 5% theoretical smoothing uplift" in report["reason"]
+    evidence = report["second_stage_eligibility"]
+    assert evidence["upgrade_available"] is False
+    assert evidence["stronger_comparator"][
+        "theoretical_smoothing_acceleration_mm_s2"
+    ] == 100_000.0
+
+
+def test_adaptive_stock_retains_stock_when_no_parameterized_upgrade_exists():
+    captures = {"X": [_capture(repeat=index) for index in range(3)]}
+    for capture in captures["X"]:
+        for candidate in capture["native_candidates"]:
+            candidate["max_accel"] = 100_000.0
+    report = analyze_calibration(
+        captures=captures,
+        axes=("X",),
+        profile="adaptive_stock",
+        experimental_mode=True,
+        **_experimental_arguments(),
+    )
+
+    assert report.get("abstain") is not True
+    assert "(" not in report["selections"][0]["shaper_type"]
+    evidence = report["axes"]["X"]["second_stage_eligibility"]
+    assert evidence["upgrade_available"] is False
+    assert evidence["eligible_parameterized_candidates"] == []
+    assert evidence["eligible_parameterized_candidate_ids"] == []
+
+
+def test_exact_parameterized_exclusion_supports_fail_closed_screen_retry():
+    common = {
+        "captures": {"X": [_capture(repeat=index) for index in range(3)]},
+        "axes": ("X",),
+        "profile": "experimental_mzv",
+        "experimental_mode": True,
+        **_experimental_arguments(),
+    }
+    first = analyze_calibration(**common)
+    rejected_id = first["selections"][0]["candidate_id"]
+    retried = analyze_calibration(
+        **common,
+        excluded_candidate_ids={"X": [rejected_id]},
+    )
+
+    assert retried.get("abstain") is not True
+    assert retried["selections"][0]["candidate_id"] != rejected_id
+    evidence = retried["axes"]["X"]["second_stage_eligibility"]
+    assert evidence["excluded_parameterized_candidate_ids"] == [rejected_id]
+    excluded = next(
+        item for item in evidence["parameterized_candidates"] if item["candidate_id"] == rejected_id
+    )
+    assert excluded["excluded_from_retry"] is True
+    assert excluded["eligible"] is False
+
+
+def test_excluded_candidate_ids_are_opaque_strict_and_never_shaper_names():
+    report = analyze_calibration(
+        captures={"X": [_capture(repeat=index) for index in range(3)]},
+        axes=("X",),
+        profile="experimental_mzv",
+        experimental_mode=True,
+        excluded_candidate_ids={"X": ["mzv(n=3,t=0.700000)"]},
+        **_experimental_arguments(),
+    )
+
+    assert report["abstain"] is True
+    assert "malformed opaque parameterized candidate ID" in report["reason"]
+
+
+def test_excluded_candidate_id_must_exist_in_replayed_analysis():
+    report = analyze_calibration(
+        captures={"X": [_capture(repeat=index) for index in range(3)]},
+        axes=("X",),
+        profile="experimental_mzv",
+        experimental_mode=True,
+        excluded_candidate_ids={
+            "X": [
+                "mzv(n=3,t=0.700000)@frequency_hz=999,damping_ratio=0.080000000000000002"
+            ]
+        },
+        **_experimental_arguments(),
+    )
+
+    assert report["abstain"] is True
+    assert "not present in this analysis" in report["reason"]
+
+
+def test_non_peak_locked_parameterized_frequency_variants_keep_exact_identities():
+    report = analyze_calibration(
+        captures={"X": [_capture(repeat=index) for index in range(3)]},
+        axes=("X",),
+        profile="experimental_mzv",
+        experimental_mode=True,
+        **_experimental_arguments(),
+    )
+
+    details = report["axes"]["X"]
+    variants = [
+        item for item in details["candidates"] if item["metadata"].get("parameterized")
+    ]
+    assert details["generalized_mzv"]["selection_candidate_count"] == len(variants)
+    assert details["generalized_mzv"]["distinct_runtime_identifier_count"] < len(variants)
+    assert len({item["candidate_id"] for item in variants}) == len(variants)
+    repeated_name = next(
+        name
+        for name in {item["name"] for item in variants}
+        if sum(item["name"] == name for item in variants) > 1
+    )
+    same_identifier = [item for item in variants if item["name"] == repeated_name]
+    assert len({item["frequency"] for item in same_identifier}) > 1
+    assert all(
+        item["metadata"]["runtime_identity"]["shaper_type"] == repeated_name
+        for item in same_identifier
+    )

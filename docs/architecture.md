@@ -38,6 +38,18 @@ upstream defines it. The explicit
 3HUMP_EI candidates with generalized-MZV candidates. Both experimental profiles
 require installed capability, validation, readback, and rollback gates.
 
+The production workflow is deliberately two-stage. Stage one belongs to normal
+Klipper or Shake&Tune: calibrate, review, apply, and save an ordinary stock
+shaper. Stage two snapshots the resulting live Klipper type, frequency, and
+damping as the authoritative exact baseline, then treats parameterized MZV only
+as an upgrade challenger. A parameterized candidate must clear the same
+residual metric and profile limit as stock candidates and provide at least 5%
+more theoretical smoothing acceleration than both the exact active baseline and
+the best eligible stock candidate fitted from the same capture. Comparing with
+the stronger of those two bounds implements both requirements. Failure returns
+an explicit no-upgrade result before temporary candidate validation, apply, or
+stage eligibility. `adaptive_stock` may retain an eligible stock winner.
+
 ## Klipper compatibility boundary
 
 Klipper does not publish a stable third-party accelerometer capture ABI. The
@@ -130,6 +142,12 @@ PSD, damping uncertainty, and the worst meaningful 5-Hz band. It is a
 fail-closed preflight screen, not a measured validation or physical-acceleration
 claim; the finite-reversal A/B ring-down gate still decides promotion.
 
+The exact-band screen is independent of the 5% smoothing-uplift gate. It
+compares installed-source pulse models for the exact baseline and challenger on
+both along- and cross-axis training PSD, using measured damping uncertainty and
+the worst meaningful 5-Hz band. Passing both theoretical gates still provides
+no physical acceleration evidence.
+
 Parameterized identifiers pass through one strict parser shared by analysis and
 Klippy. Temporary application reads status back per axis before motion resumes.
 Experimental validation also requires an enabled live Klippy axis, non-empty
@@ -142,10 +160,22 @@ includes the executor pulse capacity discovered from the installed Klipper
 source; optimization never emits a candidate above that capacity or the
 project-wide ten-pulse limit.
 
+Before any experimental sweep, compatibility preflight also requires the
+installed ten-pulse executor's `p_ind` single-pass C source signatures and
+verifies by AST that `InputShaperParams.update()` assigns the validated local
+frequency to `self.shaper_freq`. These are source-feature proofs, not live
+C-state readback; exact post-command status and Python pulse checks still run
+before held-out motion.
+
 The parser and capability foundation intentionally reserve allowlisted
 parameter extensions for later work. In particular, upstream-style
 `ei(v_tol=...)` is not runtime-exposed in this release; it cannot be passed as
 an arbitrary shaper argument.
+
+Generalized MZV is limited to `n=3..10` and exactly one finite spacing argument:
+`t>=0.5` with strict `t < (n-1)/2`, or finite `tau>=0.5` whose conversion to
+`t` must satisfy that same upstream bound. The executor and installed capability
+limits may narrow the accepted set further.
 
 ## Stock-compatible adaptive boundary
 

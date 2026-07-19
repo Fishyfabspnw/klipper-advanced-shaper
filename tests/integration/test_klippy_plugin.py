@@ -879,11 +879,16 @@ def experimental_analyzer(**kwargs):
             }
         }
     assert kwargs["experimental_mode"] is True
+    candidate_id = (
+        "mzv(n=4,t=0.800000)@frequency_hz=72.25,"
+        "damping_ratio=0.040000000000000001"
+    )
     return {
         "selections": [
             {
                 "axis": axis,
                 "shaper_type": "mzv(n=4,t=.8)",
+                "candidate_id": candidate_id,
                 "frequency_hz": 72.25,
                 "damping_ratio": 0.04,
             }
@@ -892,11 +897,113 @@ def experimental_analyzer(**kwargs):
         "axes": {
             axis: {
                 "selected": "mzv(n=4,t=0.800000)",
+                "selected_candidate_id": candidate_id,
                 "candidates": [
                     {
+                        "name": "mzv",
+                        "candidate_id": None,
+                        "frequency": 70.0,
+                        "max_accel": 15000.0,
+                    },
+                    {
                         "name": "mzv(n=4,t=0.800000)",
+                        "candidate_id": candidate_id,
+                        "frequency": 72.25,
+                        "damping_ratio": 0.04,
                         "max_accel": 18000.0,
+                        "metadata": {
+                            "parameterized": True,
+                            "design_damping_ratio": 0.04,
+                        },
                     }
+                ],
+                "modes": [{"frequency": 72.0}],
+                "damping_uncertainty_samples": [0.04, 0.06],
+                "spectrum": {
+                    "frequency_hz": [5.0, 10.0, 15.0, 20.0],
+                    "psd": [1.0, 2.0, 2.0, 1.0],
+                },
+                "cross_spectrum": {
+                    "frequency_hz": [5.0, 10.0, 15.0, 20.0],
+                    "psd": [0.1, 0.2, 0.2, 0.1],
+                },
+            }
+            for axis in kwargs["axes"]
+        },
+    }
+
+
+RETRY_CANDIDATES = (
+    {
+        "name": "mzv(n=4,t=0.800000)",
+        "candidate_id": (
+            "mzv(n=4,t=0.800000)@frequency_hz=72.25,"
+            "damping_ratio=0.040000000000000001"
+        ),
+        "frequency": 72.25,
+        "damping_ratio": 0.04,
+        "max_accel": 18000.0,
+        "metadata": {
+            "parameterized": True,
+            "design_damping_ratio": 0.04,
+        },
+    },
+    {
+        "name": "mzv(n=5,t=0.900000)",
+        "candidate_id": (
+            "mzv(n=5,t=0.900000)@frequency_hz=70.5,"
+            "damping_ratio=0.050000000000000003"
+        ),
+        "frequency": 70.5,
+        "damping_ratio": 0.05,
+        "max_accel": 17500.0,
+        "metadata": {
+            "parameterized": True,
+            "design_damping_ratio": 0.05,
+        },
+    },
+)
+
+RETRY_NATIVE_CANDIDATE = {
+    "name": "mzv",
+    "candidate_id": None,
+    "frequency": 70.0,
+    "max_accel": 15000.0,
+}
+
+
+def retrying_experimental_analyzer(**kwargs):
+    if "validation_captures" in kwargs:
+        return experimental_analyzer(**kwargs)
+    excluded = set(kwargs.get("excluded_candidate_ids", {}).get("X", []))
+    selected = next(
+        (item for item in RETRY_CANDIDATES if item["candidate_id"] not in excluded),
+        None,
+    )
+    if selected is None:
+        return {
+            "abstain": True,
+            "reason": "X has no parameterized candidate meeting the required uplift",
+            "profile": "experimental_mzv",
+        }
+    return {
+        "selections": [
+            {
+                "axis": axis,
+                "shaper_type": selected["name"],
+                "candidate_id": selected["candidate_id"],
+                "frequency_hz": selected["frequency"],
+                "damping_ratio": selected["damping_ratio"],
+            }
+            for axis in kwargs["axes"]
+        ],
+        "axes": {
+            axis: {
+                "selected": selected["name"],
+                "selected_candidate_id": selected["candidate_id"],
+                "candidates": [
+                    dict(RETRY_NATIVE_CANDIDATE),
+                    *(dict(item) for item in RETRY_CANDIDATES),
                 ],
                 "modes": [{"frequency": 72.0}],
                 "damping_uncertainty_samples": [0.04, 0.06],
@@ -954,6 +1061,50 @@ class ExperimentalAdapter(FakeAdapter):
         }
 
 
+def test_second_stage_abstention_is_artifacted_without_candidate_motion():
+    seen = {}
+
+    def no_upgrade_analyzer(**kwargs):
+        seen.update(kwargs)
+        return {
+            "abstain": True,
+            "reason": "X has no parameterized candidate that improves the stock baseline",
+            "profile": "experimental_mzv",
+            "axes": {
+                "X": {
+                    "baseline_comparison": {
+                        "status": "no_upgrade",
+                        "physical_acceleration_claim": False,
+                    }
+                }
+            },
+        }
+
+    adapter = ExperimentalAdapter()
+    writer = RecordingArtifactWriter(adapter)
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=no_upgrade_analyzer,
+        artifact_writer=writer,
+        experimental_enabled=True,
+        id_factory=lambda: "no-upgrade",
+    )
+
+    with pytest.raises(RuntimeError, match="no parameterized candidate"):
+        plugin.calibrate(
+            ("X",), profile="experimental_mzv", repeats=3, validate=True
+        )
+
+    assert seen["reference_models"]["X"]["shaper_type"] == "mzv"
+    assert len([call for call in adapter.calls if call[0] == "capture"]) == 3
+    assert not [call for call in adapter.calls if call[0] in {"apply", "transient"}]
+    assert writer.calls[0]["result_id"] == "no-upgrade"
+    assert writer.calls[0]["report"]["status"] == "rejected"
+    assert set(writer.calls[0]["raw_groups"]) == {"training"}
+    assert adapter.calls[-1] == ("artifact", "no-upgrade")
+    assert plugin.status()["attempt_status"] == "rejected"
+
+
 def adaptive_native_analyzer(**kwargs):
     if "validation_captures" in kwargs:
         return {
@@ -979,6 +1130,7 @@ def adaptive_native_analyzer(**kwargs):
             {
                 "axis": axis,
                 "shaper_type": "zvd",
+                "candidate_id": "zvd",
                 "frequency_hz": 68.0,
                 "damping_ratio": 0.07,
             }
@@ -987,7 +1139,15 @@ def adaptive_native_analyzer(**kwargs):
         "axes": {
             axis: {
                 "selected": "zvd",
-                "candidates": [{"name": "zvd", "max_accel": 16000.0}],
+                "selected_candidate_id": "zvd",
+                "candidates": [
+                    {
+                        "name": "zvd",
+                        "candidate_id": "zvd",
+                        "frequency": 68.0,
+                        "max_accel": 16000.0,
+                    }
+                ],
                 "modes": [{"frequency": 68.0}],
                 "damping_uncertainty_samples": [0.05, 0.07],
                 "spectrum": {
@@ -1016,6 +1176,7 @@ def test_adaptive_stock_native_winner_keeps_capability_and_validation_gates():
         experimental_enabled=True,
         id_factory=lambda: "adaptive-stock-result",
     )
+    plugin.minimum_max_accel["X"] = 15000.0
 
     result = plugin.calibrate(
         ("X",), profile="adaptive_stock", repeats=3, validate=True
@@ -1324,6 +1485,17 @@ def test_experimental_boundary_rejects_passed_looking_non_transient_evidence(
 def test_theoretical_screen_rejection_blocks_all_held_out_motion_and_apply():
     adapter = ExperimentalAdapter()
     seen = {}
+    writer = RecordingArtifactWriter(adapter)
+
+    def exhausting_analyzer(**kwargs):
+        excluded = kwargs.get("excluded_candidate_ids", {}).get("X", [])
+        if excluded:
+            return {
+                "abstain": True,
+                "reason": "X has no parameterized candidate meeting the required uplift",
+                "profile": "experimental_mzv",
+            }
+        return experimental_analyzer(**kwargs)
 
     def rejecting_screen(**kwargs):
         seen.update(kwargs)
@@ -1338,13 +1510,14 @@ def test_theoretical_screen_rejection_blocks_all_held_out_motion_and_apply():
 
     plugin = AdvancedInputShaper(
         adapter=adapter,
-        analyzer=experimental_analyzer,
+        analyzer=exhausting_analyzer,
         spectral_screener=rejecting_screen,
+        artifact_writer=writer,
         experimental_enabled=True,
         id_factory=lambda: "screen-rejected",
     )
 
-    with pytest.raises(RuntimeError, match="theoretical spectral non-regression"):
+    with pytest.raises(RuntimeError, match="no parameterized candidate"):
         plugin.calibrate(
             ("X",), profile="experimental_mzv", repeats=3, validate=True
         )
@@ -1360,12 +1533,186 @@ def test_theoretical_screen_rejection_blocks_all_held_out_motion_and_apply():
     )
     assert first_model_index < first_capture_index
     assert not [call for call in adapter.calls if call[0] == "apply"]
-    assert adapter.calls[-1] == ("restore", SNAPSHOT)
+    assert adapter.calls[-2:] == [
+        ("restore", SNAPSHOT),
+        ("artifact", "screen-rejected"),
+    ]
     assert plugin.status()["attempt_status"] == "rejected"
+    rejected = writer.calls[0]["report"]
+    assert rejected["status"] == "rejected"
+    assert len(rejected["theoretical_spectral_screen_attempts"]) == 1
+    assert set(writer.calls[0]["raw_groups"]) == {"training"}
     assert seen["reference_models"]["X"]["shaper_type"] == "mzv"
     assert seen["candidate_models"]["X"]["shaper_type"] == (
         "mzv(n=4,t=0.800000)"
     )
+
+
+def test_theoretical_screen_retries_offline_and_only_passing_candidate_moves():
+    adapter = ExperimentalAdapter()
+
+    def screen_first_candidate_only(**kwargs):
+        selected = kwargs["candidate_models"]["X"]["shaper_type"]
+        passed = selected == RETRY_CANDIDATES[1]["name"]
+        return {
+            "passed": passed,
+            "validation": False,
+            "held_out_validation_still_required": True,
+            "evidence_level": "theoretical_preflight_screen",
+            "reason": None if passed else "first candidate regresses a secondary band",
+            "axes": {"X": {"passed": passed}},
+        }
+
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=retrying_experimental_analyzer,
+        spectral_screener=screen_first_candidate_only,
+        experimental_enabled=True,
+        id_factory=lambda: "offline-retry-passed",
+    )
+
+    result = plugin.calibrate(
+        ("X",), profile="experimental_mzv", repeats=3, validate=True
+    )
+
+    assert result.selections[0].shaper_type == RETRY_CANDIDATES[1]["name"]
+    attempts = result.report["theoretical_spectral_screen_attempts"]
+    assert [item["screen"]["passed"] for item in attempts] == [False, True]
+    assert [item["candidates"][0]["candidate_id"] for item in attempts] == [
+        RETRY_CANDIDATES[0]["candidate_id"],
+        RETRY_CANDIDATES[1]["candidate_id"],
+    ]
+    assert all(item["candidates"][0]["model_proof"] for item in attempts)
+    training = [call for call in adapter.calls if call[0] == "capture"]
+    transients = [call for call in adapter.calls if call[0] == "transient"]
+    assert len(training) == 3
+    assert len(transients) == 6
+    applied_parameterized = [
+        selection.shaper_type
+        for call in adapter.calls
+        if call[0] == "apply"
+        for selection in call[1]
+        if selection.parameterized
+    ]
+    assert set(applied_parameterized) == {RETRY_CANDIDATES[1]["name"]}
+
+
+def test_all_theoretical_screen_candidates_fail_with_one_training_set_and_artifact():
+    adapter = ExperimentalAdapter()
+    writer = RecordingArtifactWriter(adapter)
+
+    def reject_every_screen(**kwargs):
+        return {
+            "passed": False,
+            "validation": False,
+            "held_out_validation_still_required": True,
+            "evidence_level": "theoretical_preflight_screen",
+            "reason": "candidate regresses a measured band",
+            "axes": {axis: {"passed": False} for axis in kwargs["axes"]},
+        }
+
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=retrying_experimental_analyzer,
+        spectral_screener=reject_every_screen,
+        artifact_writer=writer,
+        experimental_enabled=True,
+        id_factory=lambda: "offline-retry-exhausted",
+    )
+
+    with pytest.raises(RuntimeError, match="no parameterized candidate"):
+        plugin.calibrate(
+            ("X",), profile="experimental_mzv", repeats=3, validate=True
+        )
+
+    assert len([call for call in adapter.calls if call[0] == "capture"]) == 3
+    assert not [call for call in adapter.calls if call[0] in {"apply", "transient"}]
+    rejected = writer.calls[0]
+    assert set(rejected["raw_groups"]) == {"training"}
+    attempts = rejected["report"]["theoretical_spectral_screen_attempts"]
+    assert len(attempts) == 2
+    assert all(item["screen"]["passed"] is False for item in attempts)
+    assert rejected["report"]["excluded_candidate_ids"]["X"] == [
+        RETRY_CANDIDATES[0]["candidate_id"],
+        RETRY_CANDIDATES[1]["candidate_id"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    [
+        ("missing", "candidate ID is missing or malformed"),
+        ("malformed", "parameterized candidate ID is malformed"),
+        ("duplicate", "candidate IDs are missing or duplicated"),
+    ],
+)
+def test_experimental_candidate_identity_defects_fail_closed(defect, message):
+    def defective_analyzer(**kwargs):
+        report = experimental_analyzer(**kwargs)
+        if "validation_captures" in kwargs:
+            return report
+        if defect == "missing":
+            report["selections"][0].pop("candidate_id")
+        elif defect == "malformed":
+            report["selections"][0]["candidate_id"] = "not-an-opaque-id"
+            report["axes"]["X"]["selected_candidate_id"] = "not-an-opaque-id"
+            report["axes"]["X"]["candidates"][1]["candidate_id"] = (
+                "not-an-opaque-id"
+            )
+        else:
+            report["axes"]["X"]["candidates"].append(
+                dict(report["axes"]["X"]["candidates"][1])
+            )
+        return report
+
+    adapter = ExperimentalAdapter()
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=defective_analyzer,
+        experimental_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        plugin.calibrate(
+            ("X",), profile="experimental_mzv", repeats=3, validate=True
+        )
+
+    assert len([call for call in adapter.calls if call[0] == "capture"]) == 3
+    assert not [call for call in adapter.calls if call[0] in {"apply", "transient"}]
+    assert adapter.calls[-1] == ("restore", SNAPSHOT)
+
+
+def test_parameterized_candidate_damping_mismatch_fails_before_model_or_motion():
+    def mismatched_damping_analyzer(**kwargs):
+        report = experimental_analyzer(**kwargs)
+        if "validation_captures" not in kwargs:
+            # The selected row and opaque ID prove the analyzed candidate at
+            # damping 0.04, while the runtime selection requests 0.08.
+            report["selections"][0]["damping_ratio"] = 0.08
+        return report
+
+    adapter = ExperimentalAdapter()
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=mismatched_damping_analyzer,
+        experimental_enabled=True,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="selected candidate ID does not exactly match selection",
+    ):
+        plugin.calibrate(
+            ("X",), profile="experimental_mzv", repeats=3, validate=True
+        )
+
+    # The first model call proves the configured stock reference before the
+    # training sweeps. No selected-candidate model, SET_INPUT_SHAPER, or
+    # finite-transient validation is permitted after this identity mismatch.
+    assert len([call for call in adapter.calls if call[0] == "models"]) == 1
+    assert len([call for call in adapter.calls if call[0] == "capture"]) == 3
+    assert not [call for call in adapter.calls if call[0] in {"apply", "transient"}]
+    assert adapter.calls[-1] == ("restore", SNAPSHOT)
 
 
 def test_mismatched_configured_reference_model_fails_before_motion_or_scv_change():

@@ -72,8 +72,8 @@ def generalized_mzv_pulses(
     damping = float(damping_ratio)
     if n < 3 or n > 10:
         raise ValueError("generalized MZV requires 3..10 pulses")
-    if not 0.0 < t < 0.5 * (n - 1):
-        raise ValueError("spacing must be positive and below (n - 1) / 2")
+    if t < 0.5 or n <= 2.0 * t + 1.0 + 1e-7:
+        raise ValueError("spacing violates upstream generalized-MZV constraints")
     if not frequency > 0.0:
         raise ValueError("frequency must be positive")
     if not 0.0 <= damping < 1.0:
@@ -295,12 +295,15 @@ def optimize_generalized_mzv(
             )
         )
     if spacing_values is None:
-        spacing_values = np.linspace(0.45, 1.35, 10)
+        spacing_values = np.linspace(0.5, 1.35, 18)
 
     candidates: list[GeneralizedMZVCandidate] = []
     for n in pulse_counts:
         for spacing in spacing_values:
-            if not 0.0 < float(spacing) < 0.5 * (int(n) - 1):
+            if (
+                float(spacing) < 0.5
+                or int(n) <= 2.0 * float(spacing) + 1.0 + 1e-7
+            ):
                 continue
             for frequency in frequency_values:
                 try:

@@ -211,6 +211,21 @@ automatically applies, stages, or saves a result. Neither path changes
 `[printer] max_accel`. Do not treat a reported smoothing-derived acceleration
 as a mechanically safe machine limit.
 
+Before an experimental run, establish the baseline with normal Klipper
+`SHAPER_CALIBRATE` or Shake&Tune. Review, apply, and save the ordinary stock
+result using that tool's workflow, restart if required, and verify its type,
+frequency, and damping in live Klipper status. Those live values—not a previous
+report—are the exact baseline used by the plugin.
+
+`experimental_mzv` is a second-stage challenger. It needs at least 5% more
+theoretical smoothing acceleration than both that baseline and the best
+eligible stock candidate fitted from the same capture under common residual
+gates. It must still pass the exact-band screen and paired transient validation.
+If a theoretical gate rejects it, no candidate `SET_INPUT_SHAPER` validation
+motion occurs and the report records no upgrade. A later measured rejection
+also records no upgrade. Neither offers `APPLY` or `STAGE`; `adaptive_stock`
+may retain stock.
+
 For the stock-compatible adaptive search, enable the opt-in and use either the
 full-confidence protocol:
 
@@ -227,6 +242,8 @@ ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL
 Fast validation performs one unshaped training resonance sweep and four short
 transient captures per axis. Its duration depends on printer geometry, queued
 motion, sensor, and host timing; it intentionally makes no wall-time promise.
+Treat this fast protocol as exploratory. Repeatable qualification requires the
+standard protocol with at least three training sweeps and three A/B pairs.
 
 ## Find the results
 

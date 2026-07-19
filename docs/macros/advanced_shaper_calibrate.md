@@ -58,6 +58,24 @@ The ordinary profiles do not silently add ZVD or parameterized shapers to
 Klipper's default candidate set. The six-family override is used only by the
 explicit `adaptive_stock` profile.
 
+## Two-stage experimental workflow
+
+Before using either experimental profile, run normal Klipper
+`SHAPER_CALIBRATE` or Shake&Tune. Review, apply, and save that ordinary stock
+result, restart as its instructions require, and verify the intended shaper is
+active. Advanced Shaper uses the live Klipper type, frequency, and damping as
+the exact baseline.
+
+Run `experimental_mzv` only after that baseline is established. A generalized
+MZV is an upgrade challenger: it needs at least 5% more theoretical smoothing
+acceleration than both the exact active baseline and the best eligible stock
+candidate from the same capture, using common residual gates. It must then pass
+the exact 5-Hz-band theory screen and paired held-out ring-down validation.
+If a theoretical gate rejects it, no candidate `SET_INPUT_SHAPER` validation
+motion occurs and the report says no upgrade. A later measured rejection also
+says no upgrade. Neither exposes `APPLY` or `STAGE`; `adaptive_stock` may retain
+a stock result.
+
 ## Fast experimental example
 
 ```text
@@ -68,6 +86,10 @@ This performs one unshaped training resonance sweep and four short transient
 captures per axis. Transient time depends on geometry, queued motion, sensor,
 and host timing, so it intentionally makes no complete-workflow wall-time
 promise.
+
+Fast validation is exploratory and lower confidence. Use the standard protocol
+with at least three training sweeps and three A/B pairs before treating a result
+as repeatable qualification.
 
 ## Reading the outcome
 

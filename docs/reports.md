@@ -87,3 +87,26 @@ Experimental profiles never promote from a shaped
 combines Klipper status, enabled live Klippy `n/A/T` arrays, installed-source
 agreement, and non-empty kinematics wrappers; it is not a private
 C-executor-struct readback.
+
+Experimental capability evidence also records two pre-motion, read-only source
+proofs: the installed ten-pulse `p_ind` single-pass C executor signatures and
+the Python `SET_INPUT_SHAPER` frequency-assignment fix. These establish build
+compatibility only; they do not replace exact post-command status, pulse, or
+held-out validation evidence.
+
+The `second_stage_upgrade_eligibility` evidence explains whether each
+parameterized candidate delivered the required 5% theoretical smoothing uplift
+over the stronger of two mandatory comparators: the exact active configured
+baseline and the best eligible stock candidate from the same capture. The
+report retains both comparators, their provenance, the common residual metric,
+the candidate gain, and exclusions from an earlier rejected retry. Because the
+stronger value is used, passing means the candidate exceeded both comparators.
+This field is theory-only; it is not the exact-band screen, ring-down validation,
+or physical acceleration evidence.
+
+A no-upgrade report is a successful fail-closed outcome. A theoretical-gate
+rejection happens before candidate `SET_INPUT_SHAPER` validation motion; later
+measured rejection restores the active stock baseline exactly. Neither exposes
+a result for apply or staging. `adaptive_stock` reports may instead retain a
+stock winner. Fast reports remain exploratory; repeatable qualification requires
+the standard protocol with at least three training sweeps and three A/B pairs.

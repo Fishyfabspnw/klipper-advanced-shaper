@@ -106,13 +106,13 @@ def parse_shaper_identifier(value: str, *, allow_parameterized: bool = True) -> 
         spacing_name = "t" if "t" in parsed else "tau"
         spacing = float(parsed[spacing_name])
         spacing = float(_canonical_number(spacing))
-        if not math.isfinite(spacing) or spacing <= 0.0:
-            raise ValueError("parameterized MZV spacing must be finite and positive")
-        if spacing_name == "t" and not spacing < 0.5 * (n - 1):
-            raise ValueError("parameterized MZV t must be below (n - 1) / 2")
+        if not math.isfinite(spacing) or spacing < 0.5:
+            raise ValueError("parameterized MZV spacing must be finite and at least 0.5")
+        if spacing_name == "t" and n <= 2.0 * spacing + 1.0 + 1e-7:
+            raise ValueError("parameterized MZV t violates upstream spacing constraints")
         if spacing_name == "tau":
             t = spacing * (n - 1.0) / (n + 2.0 * spacing - 2.0)
-            if not 0.0 < t < 0.5 * (n - 1):
+            if n <= 2.0 * t + 1.0 + 1e-7:
                 raise ValueError("parameterized MZV tau violates upstream spacing constraints")
         canonical = "mzv(n=%d,%s=%s)" % (n, spacing_name, _canonical_number(spacing))
         return ShaperIdentifier(

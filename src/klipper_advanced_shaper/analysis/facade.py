@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -15,10 +15,11 @@ from .experimental import (
     generalized_mzv_pulses,
     optimize_generalized_mzv,
     oscillator_response,
+    smoothing_max_accel,
 )
 from .models import CandidateScore, Spectrum
 from .modes import find_modes
-from .selection import PROFILES, select_candidate
+from .selection import PROFILES, eligible_candidates, select_candidate
 from .signal import assess_quality, resample_uniform
 from .spectral import aggregate_spectra, integrated_band_energy, welch_psd
 from .statistics import attenuation_improvement_ci
@@ -30,6 +31,286 @@ _MEASURED_BAND_WIDTH_HZ = 5.0
 _MEASURED_MEANINGFUL_FRACTION = 0.001
 _MEASURED_BAND_MAX_REGRESSION = 0.10
 _MEASURED_TOTAL_MAX_REGRESSION = 0.05
+_EXPERIMENTAL_PROFILES = frozenset({"experimental_mzv", "adaptive_stock"})
+
+
+def _parameterized_candidate_id(
+    shaper_type: str, frequency_hz: float, damping_ratio: float
+) -> str:
+    identifier = parse_shaper_identifier(shaper_type)
+    frequency = float(frequency_hz)
+    damping = float(damping_ratio)
+    if (
+        not identifier.parameterized
+        or not np.isfinite(frequency)
+        or frequency <= 0.0
+        or not np.isfinite(damping)
+        or not 0.0 <= damping < 1.0
+    ):
+        raise ValueError("parameterized candidate identity is invalid")
+    return "%s@frequency_hz=%.17g,damping_ratio=%.17g" % (
+        identifier.canonical,
+        frequency,
+        damping,
+    )
+
+
+def _configured_reference_comparators(
+    reference_models: Mapping[str, Mapping[str, Any]],
+    axes: Sequence[str],
+    snapshot: Any,
+) -> dict[str, dict[str, Any]]:
+    """Validate exact installed-Klipper models and derive theoretical baselines."""
+    normalized_axes = tuple(str(axis).upper() for axis in axes)
+    if set(reference_models) != set(normalized_axes):
+        raise ValueError("configured reference models do not exactly match requested axes")
+    comparisons: dict[str, dict[str, Any]] = {}
+    scv = float(snapshot.square_corner_velocity)
+    if not np.isfinite(scv) or scv < 0.0:
+        raise ValueError("configured reference snapshot has invalid square-corner velocity")
+    for axis in normalized_axes:
+        raw = reference_models[axis]
+        try:
+            model_axis = str(raw["axis"]).upper()
+            identifier = parse_shaper_identifier(str(raw["shaper_type"]))
+            frequency = float(raw["frequency_hz"])
+            damping = float(raw["design_damping_ratio"])
+            amplitudes = np.asarray(raw["pulse_amplitudes_normalized"], dtype=float)
+            times = np.asarray(raw["pulse_times_s"], dtype=float)
+            pulse_count = int(raw["pulse_count"])
+            executor_limit = int(raw["executor_pulse_limit"])
+            snapshot_identifier = parse_shaper_identifier(
+                str(getattr(snapshot, "shaper_type_" + axis.lower()))
+            )
+            snapshot_frequency = float(getattr(snapshot, "shaper_freq_" + axis.lower()))
+            snapshot_damping = float(getattr(snapshot, "damping_ratio_" + axis.lower()))
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise ValueError("%s configured reference model is malformed" % axis) from error
+        if (
+            model_axis != axis
+            or raw.get("api_signature_verified") is not True
+            or raw.get("source") != "installed_klipper_shaper_defs.init_shaper"
+            or raw.get("theoretical_model_only") is not True
+            or raw.get("live_c_executor_readback") is not False
+            or not np.isfinite(frequency)
+            or frequency <= 0.0
+            or not np.isfinite(damping)
+            or not 0.0 <= damping < 1.0
+            or amplitudes.ndim != 1
+            or times.shape != amplitudes.shape
+            or pulse_count != amplitudes.size
+            or not 2 <= pulse_count <= executor_limit <= 10
+            or not np.all(np.isfinite(amplitudes))
+            or np.any(amplitudes < -1e-5)
+            or not np.isclose(float(np.sum(amplitudes)), 1.0, rtol=1e-9, atol=1e-10)
+            or not np.all(np.isfinite(times))
+            or np.any(np.diff(times) <= 0.0)
+            or identifier.canonical != snapshot_identifier.canonical
+            or not np.isclose(frequency, snapshot_frequency, rtol=0.0, atol=1e-9)
+            or not np.isclose(damping, snapshot_damping, rtol=0.0, atol=1e-9)
+        ):
+            raise ValueError(
+                "%s configured reference model failed exact installed-source checks" % axis
+            )
+        theoretical = smoothing_max_accel(amplitudes, times, scv)
+        if not np.isfinite(theoretical) or theoretical <= 0.0:
+            raise ValueError(
+                "%s configured reference has no positive theoretical smoothing acceleration"
+                % axis
+            )
+        comparisons[axis] = {
+            "name": identifier.canonical,
+            "frequency_hz": frequency,
+            "design_damping_ratio": damping,
+            "theoretical_smoothing_acceleration_mm_s2": theoretical,
+            "square_corner_velocity_mm_s": scv,
+            "metric": "klipper_0.12_path_error_theoretical_smoothing_acceleration",
+            "source": str(raw["source"]),
+            "source_module": raw.get("source_module"),
+            "source_file": raw.get("source_file"),
+            "api_signature_verified": True,
+            "model_identity_verified_against_snapshot": True,
+            "theoretical_model_only": True,
+            "live_c_executor_readback": False,
+            "physical_acceleration_claim": False,
+        }
+    return comparisons
+
+
+def _normalized_excluded_candidate_ids(
+    raw: Optional[Mapping[str, Sequence[str]]], axes: Sequence[str]
+) -> dict[str, tuple[str, ...]]:
+    normalized_axes = tuple(str(axis).upper() for axis in axes)
+    if raw is None:
+        return {axis: () for axis in normalized_axes}
+    if not isinstance(raw, Mapping) or not set(raw).issubset(set(normalized_axes)):
+        raise ValueError("excluded candidate axes must be a subset of requested axes")
+    result: dict[str, tuple[str, ...]] = {}
+    for axis in normalized_axes:
+        values = raw.get(axis, ())
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+            raise ValueError("%s excluded candidate IDs must be a sequence" % axis)
+        candidate_ids = []
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("excluded candidate IDs must be strings")
+            try:
+                shaper_type, suffix = value.rsplit("@frequency_hz=", 1)
+                frequency_text, damping_text = suffix.split(",damping_ratio=", 1)
+                canonical = _parameterized_candidate_id(
+                    shaper_type, float(frequency_text), float(damping_text)
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError("malformed opaque parameterized candidate ID") from error
+            if value != canonical:
+                raise ValueError("parameterized candidate ID is not in canonical form")
+            candidate_ids.append(canonical)
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("%s excluded candidate IDs must be unique" % axis)
+        result[axis] = tuple(candidate_ids)
+    return result
+
+
+def _second_stage_eligibility(
+    scores: Sequence[CandidateScore],
+    profile_name: str,
+    configured_reference: Mapping[str, Any],
+    excluded_candidate_ids: Sequence[str],
+) -> tuple[list[CandidateScore], dict[str, Any]]:
+    """Gate parameterized candidates on a common theoretical uplift metric."""
+    profile = PROFILES[profile_name]
+    minimum_gain = profile.minimum_parameterized_smoothing_gain
+    if minimum_gain is None:
+        raise ValueError("second-stage eligibility requires an experimental profile")
+    stock_eligible = [
+        candidate
+        for candidate in scores
+        if not candidate.metadata.get("parameterized")
+        and (
+            profile.maximum_residual is None
+            or candidate.residual_vibration <= profile.maximum_residual
+        )
+        and np.isfinite(candidate.max_accel)
+        and candidate.max_accel > 0.0
+    ]
+    if not stock_eligible:
+        raise ValueError("no stock candidate passed the common maximum-residual gate")
+    best_stock = max(stock_eligible, key=lambda item: (item.max_accel, item.name))
+    reference_accel = float(configured_reference["theoretical_smoothing_acceleration_mm_s2"])
+    if reference_accel >= best_stock.max_accel:
+        stronger = {
+            "kind": "exact_active_configured_reference",
+            "name": str(configured_reference["name"]),
+            "theoretical_smoothing_acceleration_mm_s2": reference_accel,
+            "provenance": {
+                "source": configured_reference["source"],
+                "source_module": configured_reference.get("source_module"),
+                "source_file": configured_reference.get("source_file"),
+                "api_signature_verified": True,
+                "model_identity_verified_against_snapshot": True,
+            },
+        }
+    else:
+        stronger = {
+            "kind": "best_eligible_stock_candidate_from_same_capture",
+            "name": best_stock.name,
+            "theoretical_smoothing_acceleration_mm_s2": float(best_stock.max_accel),
+            "provenance": {
+                "source": "same_capture_native_klipper_candidate",
+                "residual_metric": best_stock.metadata.get("residual_metric"),
+                "maximum_residual": profile.maximum_residual,
+            },
+        }
+    comparator_accel = float(stronger["theoretical_smoothing_acceleration_mm_s2"])
+    excluded = set(excluded_candidate_ids)
+    known_parameterized_ids = {
+        candidate.candidate_id
+        for candidate in scores
+        if candidate.metadata.get("parameterized") and candidate.candidate_id is not None
+    }
+    if not excluded.issubset(known_parameterized_ids):
+        raise ValueError("excluded candidate IDs are not present in this analysis")
+    candidate_evidence = []
+    updated_scores = []
+    eligible_parameterized_ids = set()
+    safety_ids = {
+        item.candidate_id or item.name for item in eligible_candidates(scores, profile)
+    }
+    for candidate in scores:
+        if not candidate.metadata.get("parameterized"):
+            updated_scores.append(candidate)
+            continue
+        gain = candidate.max_accel / comparator_accel - 1.0
+        is_excluded = (candidate.candidate_id or candidate.name) in excluded
+        passed = (
+            (candidate.candidate_id or candidate.name) in safety_ids
+            and np.isfinite(gain)
+            and gain >= minimum_gain
+            and not is_excluded
+        )
+        if passed:
+            eligible_parameterized_ids.add(candidate.candidate_id or candidate.name)
+        evidence = {
+            "name": candidate.name,
+            "candidate_id": candidate.candidate_id or candidate.name,
+            "theoretical_smoothing_acceleration_mm_s2": float(candidate.max_accel),
+            "gain_fraction_over_stronger_comparator": float(gain),
+            "minimum_required_gain_fraction": float(minimum_gain),
+            "common_safety_gates_passed": (
+                candidate.candidate_id or candidate.name
+            ) in safety_ids,
+            "excluded_from_retry": is_excluded,
+            "eligible": bool(passed),
+            "evidence_level": "theoretical_model_only",
+            "physical_acceleration_claim": False,
+        }
+        candidate_evidence.append(evidence)
+        updated_scores.append(
+            replace(
+                candidate,
+                metadata={
+                    **candidate.metadata,
+                    "second_stage_upgrade_eligibility": evidence,
+                },
+            )
+        )
+    report = {
+        "required": True,
+        "metric": "klipper_0.12_path_error_theoretical_smoothing_acceleration",
+        "square_corner_velocity_mm_s": float(
+            configured_reference["square_corner_velocity_mm_s"]
+        ),
+        "minimum_required_gain_fraction": float(minimum_gain),
+        "configured_reference": dict(configured_reference),
+        "best_eligible_stock_candidate": {
+            "name": best_stock.name,
+            "frequency_hz": float(best_stock.frequency),
+            "residual_vibration": float(best_stock.residual_vibration),
+            "maximum_residual": profile.maximum_residual,
+            "theoretical_smoothing_acceleration_mm_s2": float(best_stock.max_accel),
+            "provenance": {
+                "source": "same_capture_native_klipper_candidate",
+                "residual_metric": best_stock.metadata.get("residual_metric"),
+            },
+        },
+        "stronger_comparator": stronger,
+        "excluded_parameterized_candidate_ids": list(excluded_candidate_ids),
+        "parameterized_candidates": candidate_evidence,
+        "eligible_parameterized_candidates": sorted(
+            {
+                item.name
+                for item in updated_scores
+                if (item.candidate_id or item.name) in eligible_parameterized_ids
+            }
+        ),
+        "eligible_parameterized_candidate_ids": sorted(eligible_parameterized_ids),
+        "upgrade_available": bool(eligible_parameterized_ids),
+        "evidence_level": "theoretical_model_only",
+        "resonance_validation_still_required": True,
+        "print_validation_not_performed": True,
+        "physical_acceleration_claim": False,
+    }
+    return updated_scores, report
 
 
 def _samples(capture: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -634,6 +915,8 @@ def analyze_calibration(
     experimental_mode: bool = False,
     executor_pulse_limit: int = 10,
     peak_lock: bool = False,
+    reference_models: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    excluded_candidate_ids: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> dict[str, Any]:
     """Analyze training captures or judge shaped captures against held-out baselines."""
     if peak_lock and not experimental_mode:
@@ -798,6 +1081,27 @@ def analyze_calibration(
             }
         }
 
+    reference_comparators: dict[str, dict[str, Any]] = {}
+    excluded_by_axis = {str(axis).upper(): () for axis in axes}
+    if profile in _EXPERIMENTAL_PROFILES:
+        if reference_models is None:
+            return {
+                "abstain": True,
+                "reason": (
+                    "experimental second-stage analysis requires exact verified "
+                    "configured reference models"
+                ),
+            }
+        try:
+            reference_comparators = _configured_reference_comparators(
+                reference_models, axes, snapshot
+            )
+            excluded_by_axis = _normalized_excluded_candidate_ids(
+                excluded_candidate_ids, axes
+            )
+        except (TypeError, ValueError) as error:
+            return {"abstain": True, "reason": str(error)}
+
     report: dict[str, Any] = {
         "schema_version": "1.0.0-alpha.2",
         "engine": "robust_v1+running_klipper_reference",
@@ -827,8 +1131,8 @@ def analyze_calibration(
             captures[axis],
             float(np.median(mad)),
             cross_energy / max(main_energy, 1e-12),
-            aggregate if profile == "adaptive_stock" else None,
-            cross_aggregate if profile == "adaptive_stock" else None,
+            aggregate if profile in _EXPERIMENTAL_PROFILES else None,
+            cross_aggregate if profile in _EXPERIMENTAL_PROFILES else None,
         )
         if not scores:
             return {"abstain": True, "reason": "%s native candidate data unavailable" % axis}
@@ -874,26 +1178,37 @@ def analyze_calibration(
                     "abstain": True,
                     "reason": "%s generalized-MZV optimization failed: %s" % (axis, error),
                 }
-            generalized_by_name: dict[str, Mapping[str, Any]] = {}
+            generalized_variants = []
+            runtime_identifiers = set()
+            candidate_ids = set()
             for item in generalized_report.get("pareto", []):
                 identifier = parse_shaper_identifier(str(item["shaper_type"]))
-                current = generalized_by_name.get(identifier.canonical)
-                if current is None or (
-                    float(item["smoothing_max_accel"]),
-                    -float(item["residual_energy_q95"]),
-                    -float(item["sensitivity"]),
-                ) > (
-                    float(current["smoothing_max_accel"]),
-                    -float(current["residual_energy_q95"]),
-                    -float(current["sensitivity"]),
-                ):
-                    generalized_by_name[identifier.canonical] = item
-            generalized_report["selection_candidate_count"] = len(generalized_by_name)
+                frequency = float(item["frequency_hz"])
+                design_damping = float(item["design_damping_ratio"])
+                candidate_id = _parameterized_candidate_id(
+                    identifier.canonical, frequency, design_damping
+                )
+                if candidate_id in candidate_ids:
+                    continue
+                candidate_ids.add(candidate_id)
+                runtime_identifiers.add(identifier.canonical)
+                generalized_variants.append(
+                    (identifier.canonical, candidate_id, frequency, design_damping, item)
+                )
+            generalized_report["selection_candidate_count"] = len(generalized_variants)
+            generalized_report["distinct_runtime_identifier_count"] = len(
+                runtime_identifiers
+            )
+            generalized_report["candidate_identity_fields"] = [
+                "shaper_type",
+                "frequency_hz",
+                "design_damping_ratio",
+            ]
             generalized_report["peak_lock_enabled"] = bool(peak_lock)
             generalized_report["strongest_measured_peak_hz"] = float(
                 max(modes, key=lambda mode: float(mode.amplitude)).frequency
             )
-            for canonical, item in generalized_by_name.items():
+            for canonical, candidate_id, frequency, design_damping, item in generalized_variants:
                 theoretical = float(item["smoothing_max_accel"])
                 try:
                     candidate_cross_axis_energy, cross_axis_metadata = (
@@ -912,10 +1227,10 @@ def analyze_calibration(
                 scores.append(
                     CandidateScore(
                         name=canonical,
-                        frequency=float(item["frequency_hz"]),
+                        frequency=frequency,
                         residual_vibration=float(
                             item["klipper_remaining_vibration"]
-                            if profile == "adaptive_stock"
+                            if profile in _EXPERIMENTAL_PROFILES
                             else item["residual_energy_q95"]
                         ),
                         smoothing=float(item["path_error_at_5000"]),
@@ -928,7 +1243,7 @@ def analyze_calibration(
                             "parameterized": True,
                             "residual_metric": (
                                 "common_klipper_thresholded_vibration_fraction"
-                                if profile == "adaptive_stock"
+                                if profile in _EXPERIMENTAL_PROFILES
                                 else "psd_weighted_squared_response_q95"
                             ),
                             "robust_residual_energy_q95": float(
@@ -936,7 +1251,12 @@ def analyze_calibration(
                             ),
                             "pulse_count": int(item["pulse_count"]),
                             "spacing": float(item["spacing"]),
-                            "design_damping_ratio": float(item["design_damping_ratio"]),
+                            "design_damping_ratio": design_damping,
+                            "runtime_identity": {
+                                "shaper_type": canonical,
+                                "frequency_hz": frequency,
+                                "design_damping_ratio": design_damping,
+                            },
                             "damping_uncertainty_samples": list(
                                 generalized_report["measured_damping_samples"]
                             ),
@@ -950,17 +1270,46 @@ def analyze_calibration(
                             ],
                             **cross_axis_metadata,
                         },
+                        candidate_id=candidate_id,
                     )
                 )
-        selection_pool = (
-            [item for item in scores if item.metadata.get("parameterized")]
-            if profile == "experimental_mzv"
-            else scores
-        )
+        second_stage = None
+        if profile in _EXPERIMENTAL_PROFILES:
+            try:
+                scores, second_stage = _second_stage_eligibility(
+                    scores,
+                    profile,
+                    reference_comparators[axis],
+                    excluded_by_axis[axis],
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                return {
+                    "abstain": True,
+                    "reason": "%s second-stage eligibility failed: %s" % (axis, error),
+                }
+            upgrade_ids = set(second_stage["eligible_parameterized_candidate_ids"])
+            selection_pool = [
+                item
+                for item in scores
+                if (
+                    (item.candidate_id or item.name) in upgrade_ids
+                    or (
+                        profile == "adaptive_stock"
+                        and not item.metadata.get("parameterized")
+                    )
+                )
+            ]
+        else:
+            selection_pool = scores
         if profile == "experimental_mzv" and not selection_pool:
             return {
                 "abstain": True,
-                "reason": "%s has no generalized-MZV candidate after robust gates" % axis,
+                "reason": (
+                    "%s has no parameterized candidate meeting the common safety gates "
+                    "and required 5%% theoretical smoothing uplift" % axis
+                ),
+                "axis": axis,
+                "second_stage_eligibility": second_stage,
             }
         chosen = select_candidate(selection_pool, PROFILES[profile])
         if chosen.selected is None:
@@ -988,6 +1337,7 @@ def analyze_calibration(
             {
                 "axis": axis,
                 "shaper_type": chosen.selected.name,
+                "candidate_id": chosen.selected.candidate_id or chosen.selected.name,
                 "frequency_hz": chosen.selected.frequency,
                 "damping_ratio": damping,
                 "damping_source": damping_source,
@@ -1000,7 +1350,11 @@ def analyze_calibration(
             "candidates": [asdict(item) for item in scores],
             "native_candidates": _native_candidate_summary(captures[axis]),
             "pareto": [item.name for item in chosen.frontier],
+            "pareto_candidate_ids": [
+                item.candidate_id or item.name for item in chosen.frontier
+            ],
             "selected": chosen.selected.name,
+            "selected_candidate_id": chosen.selected.candidate_id or chosen.selected.name,
             "design_damping_ratio": damping,
             "measured_design_damping_ratio": (
                 measured_design_damping if measured_damping else None
@@ -1008,6 +1362,7 @@ def analyze_calibration(
             "damping_source": damping_source,
             "damping_uncertainty_samples": damping_uncertainty_samples,
             "generalized_mzv": generalized_report,
+            "second_stage_eligibility": second_stage,
             "acceleration_limits": {
                 "theoretical_smoothing_mm_s2": float(chosen.selected.max_accel),
                 "resonance_validated_mm_s2": None,

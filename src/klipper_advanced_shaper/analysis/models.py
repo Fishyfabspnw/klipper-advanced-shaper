@@ -63,6 +63,7 @@ class CandidateScore:
     cross_axis_energy: float
     sensitivity: float
     metadata: Dict[str, Any] = field(default_factory=dict)
+    candidate_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class SelectionProfile:
     weights: Dict[str, float]
     maximum_residual: Optional[float] = None
     maximum_cross_axis: Optional[float] = None
+    minimum_parameterized_smoothing_gain: Optional[float] = None
 
 
 @dataclass(frozen=True)
