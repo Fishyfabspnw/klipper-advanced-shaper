@@ -85,30 +85,34 @@ def test_installer_force_replaces_same_version_package_without_dependency_churn(
     assert force_lines == ['  --force-reinstall --no-deps "${repo_dir}"']
 
 
-def test_readme_documents_sweep_timing_and_smoke_test_boundaries():
+def test_readme_documents_protocol_and_smoke_test_boundaries():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     normalized = " ".join(readme.split())
 
-    assert "nine full resonance sweeps per axis" in normalized
+    assert (
+        "three training resonance sweeps and six short transient validation captures per axis"
+        in normalized
+    )
+    assert "must not be described as nine or eighteen resonance sweeps" in normalized
+    assert "finite-reversal ring-down pairs" in normalized
     assert "ACCEL_PER_HZ` changes excitation intensity, not sweep duration" in normalized
     assert "REPEATS=1 VALIDATE=0" in normalized
     assert "full-confidence default requires `REPEATS>=3`" in normalized
-    assert "approximately 5.4 minutes of resonance motion per axis at 2 Hz/s" in normalized
-    assert "five commanded sweeps" in normalized
-    assert "movement between probe points" in normalized
-    assert "not a promise that the complete axis workflow finishes" in normalized
+    assert "no wall-time promise is made" in normalized
     assert "Validation-rejected attempts retain diagnostic artifacts" in normalized
     assert "never become eligible for apply or stage" in normalized
     assert "unsigned decimal from 20 through 350" in normalized
     assert "does not require Klipper's optional `[respond]` section" in normalized
     assert "fit within 80% of the printer's current" in normalized
     assert "does not guarantee a PSD above `1e-5`" in normalized
-    assert "performs 18 total sweeps" in normalized
     assert "free numeric excitation control" in normalized.lower()
     assert "standard macro UI cannot attach a separate tooltip to each input" in normalized
     assert "modify Klipper's motion planner" in normalized
     assert "It does **not** modify" in normalized
     assert "installation alone does not create it" in normalized
+    assert "not a readback of Klipper's private C executor structure" in normalized
+    assert "ADXL345, LIS2DW, and LIS3DH" in normalized
+    assert "abstain before transient motion" in normalized
 
 
 def test_readme_has_complete_calibration_parameter_reference():

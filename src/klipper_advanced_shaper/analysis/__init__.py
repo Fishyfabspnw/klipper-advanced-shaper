@@ -20,6 +20,7 @@ from .models import (
     TransferMetrics,
 )
 from .modes import find_modes
+from .non_regression import theoretical_spectral_non_regression
 from .selection import PROFILES, pareto_frontier, select_candidate
 from .signal import assess_quality, infer_sample_rate, resample_uniform
 from .spectral import (
@@ -60,5 +61,6 @@ __all__ = [
     "resample_uniform",
     "select_candidate",
     "transfer_coherence",
+    "theoretical_spectral_non_regression",
     "welch_psd",
 ]

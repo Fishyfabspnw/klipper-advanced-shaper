@@ -7,6 +7,8 @@ kept dependency-injected and therefore importable without Klipper installed.
 from __future__ import annotations
 
 import importlib
+import inspect
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +55,8 @@ class ShaperSelection:
             )
         object.__setattr__(self, "shaper_type", identifier.canonical)
         object.__setattr__(self, "axis", axis)
+        object.__setattr__(self, "frequency", float(self.frequency))
+        object.__setattr__(self, "damping_ratio", float(self.damping_ratio))
 
     @property
     def parameterized(self) -> bool:
@@ -81,6 +85,10 @@ class PrinterAdapter(Protocol):
         selections: Sequence[ShaperSelection] = (),
         max_vibrations: Optional[float] = None,
     ) -> Mapping[str, Any]: ...
+    def preflight_transient(self, axes: Sequence[str]) -> Mapping[str, Any]: ...
+    def build_shaper_models(
+        self, selections: Sequence[ShaperSelection]
+    ) -> Mapping[str, Mapping[str, Any]]: ...
     def snapshot(self) -> PrinterSnapshot: ...
     def capture(
         self,
@@ -91,8 +99,18 @@ class PrinterAdapter(Protocol):
         hz_per_sec: Optional[float] = None,
         max_vibrations: Optional[float] = None,
     ) -> Any: ...
+    def capture_transient(
+        self,
+        axis: str,
+        repeat: int,
+        plan: Mapping[str, Any],
+        max_accel_mm_s2: float,
+        speed_mm_s: float,
+        post_command_guard_seconds: float,
+    ) -> Any: ...
     def apply_temporary(self, selections: Sequence[ShaperSelection]) -> None: ...
     def set_test_square_corner_velocity(self, value: float) -> None: ...
+    def set_test_max_accel(self, value: float) -> None: ...
     def restore(self, snapshot: PrinterSnapshot) -> None: ...
     def stage(self, selections: Sequence[ShaperSelection]) -> None: ...
     def respond(self, message: str) -> None: ...
@@ -121,6 +139,7 @@ class KlipperPrinterAdapter:
         self._executor_pulse_limit = executor_pulse_limit
         self._capture_native_shapers: Optional[Sequence[str]] = None
         self.last_capability: Optional[Mapping[str, Any]] = None
+        self.last_live_python_pulse_proof: Optional[Mapping[str, Any]] = None
 
     def configure_capture_profile(self, profile: str) -> None:
         self._capture_native_shapers = (
@@ -174,6 +193,42 @@ class KlipperPrinterAdapter:
 
         module = self._load_shaper_defs()
         executor_limit = self._get_executor_pulse_limit()
+        shaping = self._shaping_status()
+        if shaping.get("_advanced_shaper_raw_params") is not True:
+            raise RuntimeError(
+                "installed Klipper cannot provide raw input-shaper parameters "
+                "required for exact experimental readback and rollback"
+            )
+        exact_status: dict[str, Any] = {
+            "source": "input_shaper.get_shapers raw params"
+        }
+        for axis in ("X", "Y"):
+            suffix = axis.lower()
+            try:
+                identifier = parse_shaper_identifier(
+                    str(shaping["shaper_type_" + suffix]),
+                    allow_parameterized=True,
+                ).canonical
+                frequency = float(shaping["shaper_freq_" + suffix])
+                damping = float(shaping["damping_ratio_" + suffix])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "installed Klipper raw %s-axis shaper status is malformed" % axis
+                ) from error
+            if (
+                not math.isfinite(frequency)
+                or not 1.0 <= frequency <= 200.0
+                or not math.isfinite(damping)
+                or not 0.0 <= damping < 1.0
+            ):
+                raise RuntimeError(
+                    "installed Klipper raw %s-axis shaper status is unsafe" % axis
+                )
+            exact_status[axis] = {
+                "canonical_shaper": identifier,
+                "frequency_hz": frequency,
+                "damping_ratio": damping,
+            }
         upper_probe = min(executor_limit, 10)
         proofs = [
             prove_runtime_generalized_mzv(module, syntax)
@@ -200,6 +255,7 @@ class KlipperPrinterAdapter:
             "executor_pulse_limit": executor_limit,
             "proofs": proofs,
             "native_proof": native_proof,
+            "exact_status_readback": exact_status,
             "reason": None if failed is None else failed.get("reason"),
         }
         if failed is not None:
@@ -227,6 +283,102 @@ class KlipperPrinterAdapter:
         ]
         self.last_capability = proof
         return proof
+
+    def build_shaper_models(
+        self, selections: Sequence[ShaperSelection]
+    ) -> Mapping[str, Mapping[str, Any]]:
+        """Realize exact selections with the installed Klipper shaper source.
+
+        These pulse models are used only for a conservative theoretical screen.
+        They neither read back the live C executor nor replace held-out validation.
+        """
+        module = self._load_shaper_defs()
+        executor_limit = self._get_executor_pulse_limit()
+        try:
+            get_config = module.get_shaper_cfg
+            initialize = module.init_shaper
+            get_signature = inspect.signature(get_config)
+            init_signature = inspect.signature(initialize)
+            get_signature.bind("mzv")
+            init_signature.bind("mzv", 60.0, 0.1)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "installed Klipper shaper model API is unavailable or incompatible"
+            ) from error
+
+        models: dict[str, Mapping[str, Any]] = {}
+        for selection in selections:
+            identifier = parse_shaper_identifier(
+                selection.shaper_type, allow_parameterized=True
+            )
+            try:
+                config = get_config(identifier.canonical)
+                pulses = initialize(
+                    identifier.canonical,
+                    float(selection.frequency),
+                    float(selection.damping_ratio),
+                )
+                amplitudes, times = pulses
+                amplitude_values = [float(value) for value in amplitudes]
+                time_values = [float(value) for value in times]
+            except Exception as error:  # Klipper uses version-specific errors.
+                raise RuntimeError(
+                    "installed Klipper could not realize exact %s-axis reference %s"
+                    % (selection.axis, identifier.canonical)
+                ) from error
+            config_name = str(getattr(config, "name", "")).lower()
+            if config is None or config_name != identifier.family:
+                raise RuntimeError(
+                    "installed Klipper did not resolve exact shaper family %s"
+                    % identifier.family
+                )
+            if (
+                not 2 <= len(amplitude_values) <= executor_limit
+                or len(amplitude_values) != len(time_values)
+                or any(not math.isfinite(value) for value in amplitude_values)
+                or any(value < -1e-5 for value in amplitude_values)
+                or any(not math.isfinite(value) for value in time_values)
+                or any(
+                    time_values[index] > time_values[index + 1]
+                    for index in range(len(time_values) - 1)
+                )
+            ):
+                raise RuntimeError(
+                    "installed Klipper returned an unsafe pulse model for %s"
+                    % identifier.canonical
+                )
+            amplitude_sum = float(sum(amplitude_values))
+            if not math.isfinite(amplitude_sum) or amplitude_sum <= 0.0:
+                raise RuntimeError(
+                    "installed Klipper returned a non-normalizable pulse model for %s"
+                    % identifier.canonical
+                )
+            models[selection.axis] = {
+                "axis": selection.axis,
+                "shaper_type": identifier.canonical,
+                "family": identifier.family,
+                "frequency_hz": float(selection.frequency),
+                "design_damping_ratio": float(selection.damping_ratio),
+                "pulse_count": len(amplitude_values),
+                "pulse_amplitudes_normalized": [
+                    value / amplitude_sum for value in amplitude_values
+                ],
+                "pulse_times_s": time_values,
+                "source": "installed_klipper_shaper_defs.init_shaper",
+                "source_module": str(getattr(module, "__name__", type(module).__name__)),
+                "source_file": (
+                    Path(str(module.__file__)).name
+                    if getattr(module, "__file__", None)
+                    else None
+                ),
+                "api_signature_verified": True,
+                "executor_pulse_limit": executor_limit,
+                "theoretical_model_only": True,
+                "live_c_executor_readback": False,
+            }
+        if set(models) != {selection.axis for selection in selections}:
+            raise RuntimeError("exact installed-Klipper shaper models are incomplete")
+        return models
 
     def _prove_selection(self, selection: ShaperSelection) -> Mapping[str, Any]:
         if not selection.parameterized:
@@ -285,6 +437,15 @@ class KlipperPrinterAdapter:
         return self.capture_provider.preflight_excitation(
             tuple(axes), accel_per_hz, hz_per_sec
         )
+
+    def preflight_transient(self, axes: Sequence[str]) -> Mapping[str, Any]:
+        if self.capture_provider is None or not hasattr(
+            self.capture_provider, "preflight_transient"
+        ):
+            raise RuntimeError(
+                "capture provider cannot prove finite transient validation support"
+            )
+        return self.capture_provider.preflight_transient(tuple(axes))
 
     def snapshot(self) -> PrinterSnapshot:
         eventtime = self.printer.get_reactor().monotonic()
@@ -347,23 +508,72 @@ class KlipperPrinterAdapter:
             max_vibrations=max_vibrations,
         )
 
+    def capture_transient(
+        self,
+        axis: str,
+        repeat: int,
+        plan: Mapping[str, Any],
+        max_accel_mm_s2: float,
+        speed_mm_s: float,
+        post_command_guard_seconds: float,
+    ) -> Any:
+        if self.capture_provider is None or not hasattr(
+            self.capture_provider, "capture_transient"
+        ):
+            raise RuntimeError(
+                "capture provider cannot perform finite transient validation"
+            )
+        return self.capture_provider.capture_transient(
+            axis=axis,
+            repeat=repeat,
+            plan=plan,
+            max_accel_mm_s2=max_accel_mm_s2,
+            speed_mm_s=speed_mm_s,
+            post_command_guard_seconds=post_command_guard_seconds,
+        )
+
     def _shaping_status(self, eventtime: Optional[float] = None) -> dict[str, Any]:
         input_shaper = self.printer.lookup_object("input_shaper", None)
         if input_shaper is None:
             raise RuntimeError("Klipper input_shaper status is unavailable")
         if eventtime is None:
             eventtime = self.printer.get_reactor().monotonic()
+        # Current upstream AxisInputShaper.params.get_status() deliberately
+        # formats frequency to three decimals.  Prefer the raw parameter
+        # attributes so a snapshot can be restored without quantizing an
+        # existing value such as 75.6004 Hz.
+        get_shapers = getattr(input_shaper, "get_shapers", None)
+        if callable(get_shapers):
+            shaping: dict[str, Any] = {}
+            raw = True
+            for shaper in get_shapers():
+                suffix = str(shaper.axis).lower()
+                params = shaper.params
+                if all(
+                    hasattr(params, name)
+                    for name in ("shaper_type", "shaper_freq", "damping_ratio")
+                ):
+                    shaping["shaper_type_" + suffix] = params.shaper_type
+                    shaping["shaper_freq_" + suffix] = params.shaper_freq
+                    shaping["damping_ratio_" + suffix] = params.damping_ratio
+                else:
+                    raw = False
+                    for key, value in params.get_status().items():
+                        shaping[key + "_" + suffix] = value
+            shaping["_advanced_shaper_raw_params"] = raw
+            return shaping
         if hasattr(input_shaper, "get_status"):
-            return dict(input_shaper.get_status(eventtime))
+            shaping = dict(input_shaper.get_status(eventtime))
+            shaping["_advanced_shaper_raw_params"] = False
+            return shaping
         shaping: dict[str, Any] = {}
-        for shaper in input_shaper.get_shapers():
-            suffix = str(shaper.axis).lower()
-            for key, value in shaper.params.get_status().items():
-                shaping[key + "_" + suffix] = value
-        return shaping
+        raise RuntimeError("Klipper input_shaper status API is unavailable")
 
     def verify_applied(self, selections: Sequence[ShaperSelection]) -> None:
         shaping = self._shaping_status()
+        exact = shaping.get("_advanced_shaper_raw_params") is True
+        frequency_tolerance = 5e-12 if exact else 0.0005
+        damping_tolerance = 5e-12 if exact else 0.0000005
         for item in selections:
             suffix = item.axis.lower()
             try:
@@ -381,16 +591,171 @@ class KlipperPrinterAdapter:
                     "%s-axis shaper readback mismatch: expected %s, got %s"
                     % (item.axis, item.shaper_type, actual_type)
                 )
-            if abs(actual_frequency - item.frequency) > 0.0005:
+            if abs(actual_frequency - item.frequency) > frequency_tolerance:
                 raise RuntimeError(
                     "%s-axis frequency readback mismatch: expected %.6f, got %.6f"
                     % (item.axis, item.frequency, actual_frequency)
                 )
-            if abs(actual_damping - item.damping_ratio) > 0.0000005:
+            if abs(actual_damping - item.damping_ratio) > damping_tolerance:
                 raise RuntimeError(
                     "%s-axis damping readback mismatch: expected %.6f, got %.6f"
                     % (item.axis, item.damping_ratio, actual_damping)
                 )
+
+    def verify_live_python_pulses(
+        self, selections: Sequence[ShaperSelection]
+    ) -> Mapping[str, Any]:
+        """Verify live AxisInputShaper Python pulse state after SET.
+
+        Klipper has no C-struct getter.  This is therefore a strong no-motion
+        Python-layer proof, not a claim that C executor memory was read back.
+        """
+        input_shaper = self.printer.lookup_object("input_shaper", None)
+        get_shapers = getattr(input_shaper, "get_shapers", None)
+        if get_shapers is None or not callable(get_shapers):
+            raise RuntimeError("Klipper input_shaper.get_shapers API is unavailable")
+        try:
+            inspect.signature(get_shapers).bind()
+            shapers = list(get_shapers())
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("unsupported Klipper input_shaper.get_shapers API") from error
+        wrappers = getattr(
+            input_shaper, "input_shaper_stepper_kinematics", None
+        )
+        if not isinstance(wrappers, (list, tuple)) or not wrappers:
+            raise RuntimeError(
+                "Klipper input shaper has no active stepper-kinematics wrappers"
+            )
+        module = self._load_shaper_defs()
+        initialize = getattr(module, "init_shaper", None)
+        if initialize is None or not callable(initialize):
+            raise RuntimeError("installed Klipper init_shaper API is unavailable")
+        try:
+            inspect.signature(initialize).bind("mzv", 60.0, 0.1)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("unsupported installed Klipper init_shaper API") from error
+
+        axes: dict[str, Any] = {}
+        for selection in selections:
+            suffix = selection.axis.lower()
+            matches = [item for item in shapers if str(getattr(item, "axis", "")).lower() == suffix]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "%s-axis live Python shaper is not uniquely available" % selection.axis
+                )
+            shaper = matches[0]
+            enabled = getattr(shaper, "is_enabled", None)
+            if enabled is None or not callable(enabled):
+                raise RuntimeError(
+                    "%s-axis live Python shaper lacks is_enabled()" % selection.axis
+                )
+            try:
+                inspect.signature(enabled).bind()
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "%s-axis live Python shaper has unsupported is_enabled API"
+                    % selection.axis
+                ) from error
+            required = ("n", "A", "T", "saved", "params")
+            missing = [name for name in required if not hasattr(shaper, name)]
+            if missing:
+                raise RuntimeError(
+                    "%s-axis live Python shaper is missing pulse fields: %s"
+                    % (selection.axis, ",".join(missing))
+                )
+            if not enabled() or shaper.saved is not None:
+                raise RuntimeError(
+                    "%s-axis input shaping is not actively enabled" % selection.axis
+                )
+            params = shaper.params
+            try:
+                actual_identifier = parse_shaper_identifier(
+                    str(params.shaper_type), allow_parameterized=True
+                ).canonical
+                actual_frequency = float(params.shaper_freq)
+                actual_damping = float(params.damping_ratio)
+                actual_n = int(shaper.n)
+                actual_amplitudes = [float(value) for value in shaper.A]
+                actual_times = [float(value) for value in shaper.T]
+                commanded_frequency = float(selection.frequency)
+                commanded_damping = float(selection.damping_ratio)
+                expected_amplitudes, expected_times = initialize(
+                    selection.shaper_type,
+                    commanded_frequency,
+                    commanded_damping,
+                )
+                expected_amplitudes = [float(value) for value in expected_amplitudes]
+                expected_times = [float(value) for value in expected_times]
+            except Exception as error:  # Klipper raises version-specific errors.
+                raise RuntimeError(
+                    "cannot inspect %s-axis live Python pulse state" % selection.axis
+                ) from error
+            if actual_identifier != selection.shaper_type:
+                raise RuntimeError(
+                    "%s-axis live Python shaper identifier mismatch" % selection.axis
+                )
+            if abs(actual_frequency - commanded_frequency) > 0.0000000005:
+                raise RuntimeError(
+                    "%s-axis live Python shaper frequency mismatch" % selection.axis
+                )
+            if abs(actual_damping - commanded_damping) > 0.0000000005:
+                raise RuntimeError(
+                    "%s-axis live Python shaper damping mismatch" % selection.axis
+                )
+            if (
+                actual_n <= 0
+                or actual_n != len(actual_amplitudes)
+                or actual_n != len(actual_times)
+                or actual_n != len(expected_amplitudes)
+                or actual_n != len(expected_times)
+            ):
+                raise RuntimeError(
+                    "%s-axis live Python pulse count mismatch" % selection.axis
+                )
+            if any(
+                not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
+                for actual, expected in zip(actual_amplitudes, expected_amplitudes)
+            ):
+                raise RuntimeError(
+                    "%s-axis live Python pulse amplitude mismatch" % selection.axis
+                )
+            if any(
+                not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
+                for actual, expected in zip(actual_times, expected_times)
+            ):
+                raise RuntimeError(
+                    "%s-axis live Python pulse timing mismatch" % selection.axis
+                )
+            axes[selection.axis] = {
+                "axis": selection.axis,
+                "canonical_shaper": selection.shaper_type,
+                "frequency_hz": actual_frequency,
+                "damping_ratio": actual_damping,
+                "pulse_count": actual_n,
+                "pulse_span_seconds": float(max(actual_times) - min(actual_times)),
+                "post_command_guard_seconds": float(
+                    max(actual_times) - min(actual_times) + 0.020
+                ),
+                "enabled": True,
+                "saved_disabled_state_present": False,
+                "amplitudes_match_installed_init_shaper": True,
+                "times_match_installed_init_shaper": True,
+            }
+        proof: dict[str, Any] = {
+            "passed": True,
+            "layer": "live_klippy_axis_input_shaper_python_state",
+            "source": "input_shaper.get_shapers plus installed shaper_defs.init_shaper",
+            "active_axis_verified": True,
+            "python_axis_state_verified": True,
+            "input_shaper_kinematics_wrapper_presence_verified": True,
+            "active_c_attachment_verified": False,
+            "input_shaper_stepper_kinematics_count": len(wrappers),
+            "live_c_executor_readback": False,
+            "c_struct_state_claimed": False,
+            "axes": axes,
+        }
+        self.last_live_python_pulse_proof = proof
+        return proof
 
     def apply_temporary(self, selections: Sequence[ShaperSelection]) -> None:
         values: dict[str, str] = {}
@@ -398,8 +763,8 @@ class KlipperPrinterAdapter:
             self._prove_selection(item)
             suffix = item.axis.upper()
             values["SHAPER_TYPE_" + suffix] = item.shaper_type
-            values["SHAPER_FREQ_" + suffix] = "%.6f" % item.frequency
-            values["DAMPING_RATIO_" + suffix] = "%.6f" % item.damping_ratio
+            values["SHAPER_FREQ_" + suffix] = repr(float(item.frequency))
+            values["DAMPING_RATIO_" + suffix] = repr(float(item.damping_ratio))
         if values:
             command = "SET_INPUT_SHAPER " + " ".join(
                 "%s=%s" % pair for pair in sorted(values.items())
@@ -420,6 +785,22 @@ class KlipperPrinterAdapter:
         if actual is None or abs(float(actual) - target) > 0.0000005:
             raise RuntimeError(
                 "SCV readback mismatch: expected %.6f, got %s"
+                % (target, actual if actual is not None else "unavailable")
+            )
+
+    def set_test_max_accel(self, value: float) -> None:
+        target = float(value)
+        if not 1.0 <= target <= 5000.0:
+            raise RuntimeError("transient test max_accel is outside 1..5000 mm/s^2")
+        self.gcode.run_script_from_command(
+            "SET_VELOCITY_LIMIT ACCEL=%.6f" % target
+        )
+        eventtime = self.printer.get_reactor().monotonic()
+        status = self.printer.lookup_object("toolhead").get_status(eventtime)
+        actual = status.get("max_accel")
+        if actual is None or abs(float(actual) - target) > 0.0005:
+            raise RuntimeError(
+                "transient max_accel readback mismatch: expected %.6f, got %s"
                 % (target, actual if actual is not None else "unavailable")
             )
 
@@ -444,16 +825,15 @@ class KlipperPrinterAdapter:
             )
         except BaseException as error:
             errors.append(error)
-        velocity = (
-            "SET_VELOCITY_LIMIT VELOCITY=%.6f ACCEL=%.6f "
-            "SQUARE_CORNER_VELOCITY=%.6f"
-        ) % (
-            snapshot.max_velocity,
-            snapshot.max_accel,
-            snapshot.square_corner_velocity,
+        velocity = "SET_VELOCITY_LIMIT VELOCITY=%s ACCEL=%s SQUARE_CORNER_VELOCITY=%s" % (
+            repr(float(snapshot.max_velocity)),
+            repr(float(snapshot.max_accel)),
+            repr(float(snapshot.square_corner_velocity)),
         )
         if snapshot.minimum_cruise_ratio is not None:
-            velocity += " MINIMUM_CRUISE_RATIO=%.6f" % snapshot.minimum_cruise_ratio
+            velocity += " MINIMUM_CRUISE_RATIO=%s" % repr(
+                float(snapshot.minimum_cruise_ratio)
+            )
         try:
             self.gcode.run_script_from_command(velocity)
             self._verify_velocity(snapshot)
@@ -478,10 +858,16 @@ class KlipperPrinterAdapter:
         if snapshot.minimum_cruise_ratio is not None:
             expected["minimum_cruise_ratio"] = snapshot.minimum_cruise_ratio
         for name, value in expected.items():
-            if name not in status or abs(float(status[name]) - float(value)) > 0.0000005:
+            if name not in status or not math.isclose(
+                float(status[name]), float(value), rel_tol=0.0, abs_tol=5e-12
+            ):
                 raise RuntimeError(
-                    "rollback readback mismatch for %s: expected %.6f, got %s"
-                    % (name, value, status.get(name, "unavailable"))
+                    "rollback readback mismatch for %s: expected %s, got %s"
+                    % (
+                        name,
+                        repr(float(value)),
+                        status.get(name, "unavailable"),
+                    )
                 )
 
     def stage(self, selections: Sequence[ShaperSelection]) -> None:
@@ -490,9 +876,13 @@ class KlipperPrinterAdapter:
             self._prove_selection(item)
             suffix = item.axis.lower()
             configfile.set("input_shaper", "shaper_type_" + suffix, item.shaper_type)
-            configfile.set("input_shaper", "shaper_freq_" + suffix, "%.6f" % item.frequency)
             configfile.set(
-                "input_shaper", "damping_ratio_" + suffix, "%.6f" % item.damping_ratio
+                "input_shaper", "shaper_freq_" + suffix,
+                repr(float(item.frequency)),
+            )
+            configfile.set(
+                "input_shaper", "damping_ratio_" + suffix,
+                repr(float(item.damping_ratio)),
             )
 
     def respond(self, message: str) -> None:

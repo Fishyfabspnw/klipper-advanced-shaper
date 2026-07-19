@@ -28,8 +28,9 @@ The attempt directory contains:
   actually available.
 - `candidates.csv`: aggregate native-candidate and Pareto metrics.
 - `validation.csv`: aggregate held-out attenuation and cross-axis gate metrics,
-  exact reference/candidate identifiers, and the finite per-pair energy values
-  used by the decision, when validation data exists.
+  exact reference/candidate identifiers, and the raw per-pair energy values
+  used by the decision, when validation data exists. Experimental-profile rows
+  use finite-reversal ring-down captures.
 - `result.json` and `manifest.json`: exact versioned report and integrity hashes.
 - `captures.npz`: private lossless sample arrays when `keep_raw_data: True` and
   capture groups are available.
@@ -46,13 +47,17 @@ evidence is recorded as unavailable rather than inferred from the model.
 Every completed analysis also records the resolved excitation source and value,
 maximum sweep frequency, sweeping acceleration, current printer acceleration
 limit, 80% budget, and estimated peak used by the pre-motion safety check.
-The validation protocol block labels full-confidence versus lower-confidence
-fast validation, repeat and sweep counts, effective Hz/s, estimated physical
-motion time per axis, the A/B capture order, and stable pair IDs. Per-axis
-validation rows include the paired-capture design and pair count. Candidate CSV
-rows identify whether cross-axis ranking came from an upstream native response
-curve or the generalized oscillator model. This timing deliberately excludes
-host analysis, report rendering, and artifact I/O.
+For experimental profiles, the validation protocol block labels
+full-confidence versus lower-confidence fast validation, training-sweep and
+transient-pair counts, effective Hz/s, the A/B capture order, and stable pair
+IDs. Per-axis rows identify the `finite_reversal_ringdown_v1` raw
+post-command-window protocol and pair count. Candidate CSV rows identify
+whether cross-axis ranking came from an upstream native response curve or the
+generalized oscillator model. Reports do not promise a wall-clock duration for
+transient validation. The per-axis validation evidence also records paired
+sample-rate/duration fairness and measured total-band plus meaningful 5-Hz-band
+non-regression for commanded and cross-axis response, including raw paired
+energies, confidence bounds, thresholds, and the worst band.
 For experimental profiles, the same protocol and runtime-capability records
 also preserve native-fitting `max_vibrations` provenance: its finite fraction,
 percent, source (`selection_profile.maximum_residual`), and upstream parameter
@@ -72,3 +77,13 @@ is smoothing-model context, not a validated acceleration limit.
 Neither a normalized validation plot nor its confidence interval establishes a
 mechanically safe or print-validated acceleration. Theoretical smoothing,
 resonance validation, and print validation remain separate evidence levels.
+
+Experimental reports additionally include a theory-only spectral
+non-regression screen: exact configured baseline versus candidate, along and
+cross axis, worst meaningful 5-Hz band, and measured damping uncertainty. A
+passing screen is not validation and makes no physical acceleration claim.
+Experimental profiles never promote from a shaped
+`TEST_RESONANCES INPUT_SHAPING=1` capture. Temporary experimental-shaper proof
+combines Klipper status, enabled live Klippy `n/A/T` arrays, installed-source
+agreement, and non-empty kinematics wrappers; it is not a private
+C-executor-struct readback.

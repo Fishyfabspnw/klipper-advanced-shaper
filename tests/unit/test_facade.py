@@ -198,6 +198,116 @@ def test_facade_fast_two_repeat_validation_keeps_ci_qc_and_cross_axis_gates():
     )
 
 
+def test_facade_labels_finite_reversal_ringdown_evidence_exactly():
+    training = {"X": [_capture(repeat=index) for index in range(2)]}
+    first = analyze_calibration(
+        captures=training,
+        axes=("X",),
+        profile="performance",
+        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
+    )
+    reference = [_capture(scale=1.0, repeat=index) for index in range(2)]
+    candidate = [_capture(scale=0.75, repeat=index) for index in range(2)]
+    for capture in reference + candidate:
+        capture["metadata"]["validation_capture_kind"] = (
+            "finite_reversal_ringdown"
+        )
+
+    result = analyze_calibration(
+        captures=training,
+        held_out_captures={"X": reference},
+        validation_captures={"X": candidate},
+        axes=("X",),
+        profile="experimental_mzv",
+        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
+        prior_report=first,
+        validation_pair_ids={"X": ["X-01", "X-02"]},
+        experimental_mode=True,
+    )
+
+    evidence = result["validation"]["axes"]["X"]
+    assert evidence["capture_design"] == (
+        "paired_interleaved_ab_finite_reversal_ringdown"
+    )
+    assert evidence["validation_evidence_kind"] == "finite_reversal_ringdown_v1"
+    assert evidence["energy_window"] == "raw_accelerometer_post_command_ringdown"
+    assert evidence["paired_window_fairness"]["passed"] is True
+    assert evidence["measured_spectral_non_regression"]["passed"] is True
+
+
+def test_finite_ringdown_rejects_catastrophic_new_frequency_regression():
+    training = {"X": [_capture(repeat=index) for index in range(3)]}
+    first = analyze_calibration(
+        captures=training,
+        axes=("X",),
+        profile="experimental_mzv",
+        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
+        experimental_mode=True,
+    )
+    reference = [_capture(scale=1.0, repeat=index) for index in range(3)]
+    candidate = [_capture(scale=0.5, repeat=index) for index in range(3)]
+    for capture in reference + candidate:
+        capture["metadata"]["validation_capture_kind"] = "finite_reversal_ringdown"
+    for capture in candidate:
+        samples = np.asarray(capture["samples"], dtype=float)
+        samples[:, 1] += 10.0 * np.sin(2.0 * np.pi * 130.0 * samples[:, 0])
+        capture["samples"] = samples
+
+    result = analyze_calibration(
+        captures=training,
+        held_out_captures={"X": reference},
+        validation_captures={"X": candidate},
+        axes=("X",),
+        profile="experimental_mzv",
+        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
+        prior_report=first,
+        validation_pair_ids={"X": ["X-01", "X-02", "X-03"]},
+        experimental_mode=True,
+    )
+
+    evidence = result["validation"]["axes"]["X"]
+    screen = evidence["measured_spectral_non_regression"]
+    worst = screen["channels"]["commanded_axis"]["worst_meaningful_band"]
+    assert result["validation"]["passed"] is False
+    assert evidence["improvement_ci_95"][0] > 0.10
+    assert screen["passed"] is False
+    assert worst["frequency_band_hz"] == [130.0, 135.0]
+    assert worst["improvement_ci_95"][0] < -0.10
+
+
+def test_finite_ringdown_rejects_mismatched_paired_window_duration():
+    training = {"X": [_capture(repeat=index) for index in range(2)]}
+    first = analyze_calibration(
+        captures=training,
+        axes=("X",),
+        profile="experimental_mzv",
+        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
+        experimental_mode=True,
+    )
+    reference = [_capture(scale=1.0, repeat=index) for index in range(2)]
+    candidate = [_capture(scale=0.75, repeat=index) for index in range(2)]
+    for capture in reference + candidate:
+        capture["metadata"]["validation_capture_kind"] = "finite_reversal_ringdown"
+    for capture in candidate:
+        capture["samples"] = np.asarray(capture["samples"])[100:]
+
+    result = analyze_calibration(
+        captures=training,
+        held_out_captures={"X": reference},
+        validation_captures={"X": candidate},
+        axes=("X",),
+        profile="experimental_mzv",
+        snapshot=SimpleNamespace(square_corner_velocity=7.0, damping_ratio_x=0.08),
+        prior_report=first,
+        validation_pair_ids={"X": ["X-01", "X-02"]},
+        experimental_mode=True,
+    )
+
+    evidence = result["validation"]["axes"]["X"]
+    assert result["validation"]["passed"] is False
+    assert evidence["paired_window_fairness"]["passed"] is False
+
+
 def test_facade_rejects_cross_axis_regression_even_with_main_axis_improvement():
     training = {"X": [_capture(repeat=index) for index in range(3)]}
     first = analyze_calibration(

@@ -53,6 +53,28 @@ class FakeAdapter:
             "hz_per_sec_source": "command" if hz_per_sec is not None else "resonance_tester",
         }
 
+    def preflight_transient(self, axes):
+        self.calls.append(("transient_preflight", tuple(axes)))
+        return {
+            "passed": True,
+            "protocol": "finite_reversal_ringdown_v1",
+            "speed_mm_s": 80.0,
+            "max_accel_mm_s2": 5000.0,
+            "estimated_base_motion_seconds_per_capture_upper_bound": 4.0,
+            "estimated_motion_seconds_per_capture_upper_bound": 4.0,
+            "plans": {
+                axis: {
+                    "axis": axis,
+                    "original_position_mm": 50.0,
+                    "anchor_position_mm": 50.0,
+                    "start_position_mm": 46.0,
+                    "reversal_position_mm": 54.0,
+                    "return_position_mm": 46.0,
+                }
+                for axis in axes
+            },
+        }
+
     def snapshot(self):
         self.calls.append(("snapshot",))
         return SNAPSHOT
@@ -77,7 +99,9 @@ class FakeAdapter:
                 max_vibrations,
             )
         )
-        capture_count = sum(call[0] == "capture" for call in self.calls)
+        capture_count = sum(
+            call[0] in {"capture", "transient"} for call in self.calls
+        )
         if capture_count == self.fail_capture_at:
             raise RuntimeError("accelerometer disconnected")
         if self.controller is not None and capture_count == 1:
@@ -87,8 +111,66 @@ class FakeAdapter:
     def apply_temporary(self, selections):
         self.calls.append(("apply", tuple(selections)))
 
+    def verify_live_python_pulses(self, selections):
+        self.calls.append(("verify_live_pulses", tuple(selections)))
+        return {
+            "passed": True,
+            "live_c_executor_readback": False,
+            "axes": {
+                item.axis: {
+                    "post_command_guard_seconds": 0.03,
+                    "pulse_span_seconds": 0.01,
+                }
+                for item in selections
+            },
+        }
+
+    def capture_transient(
+        self,
+        axis,
+        repeat,
+        plan,
+        max_accel_mm_s2,
+        speed_mm_s,
+        post_command_guard_seconds,
+    ):
+        self.calls.append(
+            (
+                "transient",
+                axis,
+                repeat,
+                True,
+                None,
+                None,
+                None,
+                "finite_reversal_ringdown",
+                plan,
+                max_accel_mm_s2,
+                speed_mm_s,
+                post_command_guard_seconds,
+            )
+        )
+        capture_count = sum(
+            call[0] in {"capture", "transient"} for call in self.calls
+        )
+        if capture_count == self.fail_capture_at:
+            raise RuntimeError("accelerometer disconnected")
+        return {
+            "axis": axis,
+            "repeat": repeat,
+            "validation": True,
+            "metadata": {
+                "promotion_eligible": True,
+                "protocol": "finite_reversal_ringdown_v1",
+                "validation_capture_kind": "finite_reversal_ringdown",
+            },
+        }
+
     def set_test_square_corner_velocity(self, value):
         self.calls.append(("set_scv", float(value)))
+
+    def set_test_max_accel(self, value):
+        self.calls.append(("set_max_accel", float(value)))
 
     def restore(self, snapshot):
         self.calls.append(("restore", snapshot))
@@ -199,6 +281,25 @@ def test_calibration_validates_held_out_data_and_always_restores():
     ]
     assert adapter.calls[-1] == ("restore", SNAPSHOT)
     assert plugin.status()["state"] == "review"
+
+
+def test_default_native_validation_does_not_require_transient_private_apis():
+    adapter = FakeAdapter()
+    adapter.preflight_transient = None
+    adapter.capture_transient = None
+    adapter.verify_live_python_pulses = None
+    adapter.set_test_max_accel = None
+    plugin = AdvancedInputShaper(
+        adapter=adapter, analyzer=analyzer, id_factory=lambda: "legacy-native"
+    )
+
+    result = plugin.calibrate(("X",), profile="balanced", repeats=2, validate=True)
+
+    assert result.report["validation_protocol"]["capture_design"] == (
+        "paired_interleaved_ab"
+    )
+    assert len([call for call in adapter.calls if call[0] == "capture"]) == 6
+    assert not [call for call in adapter.calls if call[0] == "transient"]
 
 
 def test_failure_during_interleaved_pair_restores_exact_snapshot():
@@ -627,17 +728,17 @@ def test_real_adapter_uses_native_shaper_command_and_stage_does_not_save():
 
     scripts = config.printer.objects["gcode"].scripts
     assert scripts == [
-        "SET_INPUT_SHAPER DAMPING_RATIO_X=0.080000 DAMPING_RATIO_Y=0.120000 "
-        "SHAPER_FREQ_X=74.400000 SHAPER_FREQ_Y=76.400000 "
+        "SET_INPUT_SHAPER DAMPING_RATIO_X=0.08 DAMPING_RATIO_Y=0.12 "
+        "SHAPER_FREQ_X=74.4 SHAPER_FREQ_Y=76.4 "
         "SHAPER_TYPE_X=mzv SHAPER_TYPE_Y=2hump_ei"
     ]
     assert config.printer.objects["configfile"].values == [
         ("input_shaper", "shaper_type_x", "mzv"),
-        ("input_shaper", "shaper_freq_x", "74.400000"),
-        ("input_shaper", "damping_ratio_x", "0.080000"),
+        ("input_shaper", "shaper_freq_x", "74.4"),
+        ("input_shaper", "damping_ratio_x", "0.08"),
         ("input_shaper", "shaper_type_y", "2hump_ei"),
-        ("input_shaper", "shaper_freq_y", "76.400000"),
-        ("input_shaper", "damping_ratio_y", "0.120000"),
+        ("input_shaper", "shaper_freq_y", "76.4"),
+        ("input_shaper", "damping_ratio_y", "0.12"),
     ]
     assert all("SAVE_CONFIG" not in script for script in scripts)
 
@@ -769,6 +870,9 @@ def experimental_analyzer(**kwargs):
                         "qc_passed": True,
                         "improvement_ci_95": [0.12, 0.25],
                         "cross_axis_regression": 0.01,
+                        "validation_evidence_kind": "finite_reversal_ringdown_v1",
+                        "paired_window_fairness": {"passed": True},
+                        "measured_spectral_non_regression": {"passed": True},
                     }
                     for axis in kwargs["axes"]
                 },
@@ -794,6 +898,16 @@ def experimental_analyzer(**kwargs):
                         "max_accel": 18000.0,
                     }
                 ],
+                "modes": [{"frequency": 72.0}],
+                "damping_uncertainty_samples": [0.04, 0.06],
+                "spectrum": {
+                    "frequency_hz": [5.0, 10.0, 15.0, 20.0],
+                    "psd": [1.0, 2.0, 2.0, 1.0],
+                },
+                "cross_spectrum": {
+                    "frequency_hz": [5.0, 10.0, 15.0, 20.0],
+                    "psd": [0.1, 0.2, 0.2, 0.1],
+                },
             }
             for axis in kwargs["axes"]
         },
@@ -816,6 +930,29 @@ class ExperimentalAdapter(FakeAdapter):
             },
         }
 
+    def build_shaper_models(self, selections):
+        self.calls.append(("models", tuple(selections)))
+        return {
+            selection.axis: {
+                "axis": selection.axis,
+                "shaper_type": selection.shaper_type,
+                "family": selection.shaper_type.split("(", 1)[0],
+                "frequency_hz": selection.frequency,
+                "design_damping_ratio": selection.damping_ratio,
+                "pulse_count": 2,
+                "pulse_amplitudes_normalized": [0.5, 0.5],
+                "pulse_times_s": [0.0, 0.01],
+                "source": "installed_klipper_shaper_defs.init_shaper",
+                "source_module": "extras.shaper_defs",
+                "source_file": "shaper_defs.py",
+                "api_signature_verified": True,
+                "executor_pulse_limit": 10,
+                "theoretical_model_only": True,
+                "live_c_executor_readback": False,
+            }
+            for selection in selections
+        }
+
 
 def adaptive_native_analyzer(**kwargs):
     if "validation_captures" in kwargs:
@@ -828,6 +965,9 @@ def adaptive_native_analyzer(**kwargs):
                         "qc_passed": True,
                         "improvement_ci_95": [0.20, 0.40],
                         "cross_axis_regression": 0.0,
+                        "validation_evidence_kind": "finite_reversal_ringdown_v1",
+                        "paired_window_fairness": {"passed": True},
+                        "measured_spectral_non_regression": {"passed": True},
                     }
                     for axis in kwargs["axes"]
                 },
@@ -848,6 +988,16 @@ def adaptive_native_analyzer(**kwargs):
             axis: {
                 "selected": "zvd",
                 "candidates": [{"name": "zvd", "max_accel": 16000.0}],
+                "modes": [{"frequency": 68.0}],
+                "damping_uncertainty_samples": [0.05, 0.07],
+                "spectrum": {
+                    "frequency_hz": [5.0, 10.0, 15.0, 20.0],
+                    "psd": [1.0, 2.0, 2.0, 1.0],
+                },
+                "cross_spectrum": {
+                    "frequency_hz": [5.0, 10.0, 15.0, 20.0],
+                    "psd": [0.1, 0.2, 0.2, 0.1],
+                },
             }
             for axis in kwargs["axes"]
         },
@@ -884,9 +1034,13 @@ def test_adaptive_stock_native_winner_keeps_capability_and_validation_gates():
         "source": "selection_profile.maximum_residual",
         "upstream_parameter": "max_vibrations",
     }
-    assert {call[6] for call in adapter.calls if call[0] == "capture"} == {0.10}
+    training = [call for call in adapter.calls if call[0] == "capture"]
+    transients = [call for call in adapter.calls if call[0] == "transient"]
+    assert {call[6] for call in training} == {0.10}
+    assert {call[7] for call in transients} == {"finite_reversal_ringdown"}
     assert result.report["validation"]["passed"] is True
-    assert len([call for call in adapter.calls if call[0] == "capture"]) == 9
+    assert len(training) == 3
+    assert len(transients) == 6
     plugin.apply("adaptive-stock-result")
     plugin.stage("adaptive-stock-result")
     assert adapter.calls[-1][0] == "stage"
@@ -907,7 +1061,7 @@ def test_adaptive_stock_is_opt_in_and_never_allows_unvalidated_motion():
     assert adapter.calls == []
 
 
-def test_experimental_fast_validation_keeps_two_held_out_pairs_in_five_sweeps():
+def test_experimental_fast_validation_uses_one_sweep_and_four_transients():
     adapter = ExperimentalAdapter()
     plugin = AdvancedInputShaper(
         adapter=adapter,
@@ -925,11 +1079,12 @@ def test_experimental_fast_validation_keeps_two_held_out_pairs_in_five_sweeps():
         fast_validation=1,
     )
 
-    captures = [call for call in adapter.calls if call[0] == "capture"]
-    assert len(captures) == 5
-    assert sum(not call[3] for call in captures) == 1
-    assert sum(call[3] for call in captures) == 4
-    assert {call[5] for call in captures} == {2.0}
+    training = [call for call in adapter.calls if call[0] == "capture"]
+    transients = [call for call in adapter.calls if call[0] == "transient"]
+    assert len(training) == 1
+    assert len(transients) == 4
+    assert {call[5] for call in training} == {2.0}
+    assert {call[7] for call in transients} == {"finite_reversal_ringdown"}
     protocol = result.report["validation_protocol"]
     assert protocol["mode"] == "fast_lower_confidence_1_train_2_held_out"
     assert protocol["lower_confidence"] is True
@@ -937,7 +1092,16 @@ def test_experimental_fast_validation_keeps_two_held_out_pairs_in_five_sweeps():
     assert protocol["training_repeats"] == 1
     assert protocol["reference_repeats"] == 2
     assert protocol["candidate_repeats"] == 2
-    assert protocol["full_sweeps_per_axis"] == 5
+    assert protocol["full_sweeps_per_axis"] == 1
+    assert protocol["paired_transients_per_axis"] == 4
+    assert protocol["common_post_command_guard_seconds_by_axis"] == {"X": 0.03}
+    assert {
+        row["post_command_guard_seconds"] for row in protocol["capture_order"]
+    } == {0.03}
+    assert all(
+        row["capture_kind"] == "finite_reversal_ringdown"
+        for row in protocol["capture_order"]
+    )
     assert plugin.status()["validation_protocol"] == protocol
 
 
@@ -1026,6 +1190,57 @@ def test_experimental_profile_is_opt_in_and_requires_validation_before_motion():
     assert not [call for call in adapter.calls if call[0] == "capture"]
 
 
+def test_experimental_transient_api_gap_abstains_before_snapshot_or_motion():
+    adapter = ExperimentalAdapter()
+    adapter.preflight_transient = None
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=experimental_analyzer,
+        experimental_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="finite transient validation support"):
+        plugin.calibrate(
+            ("X",), profile="experimental_mzv", repeats=3, validate=True
+        )
+    assert not [
+        call
+        for call in adapter.calls
+        if call[0] in {"snapshot", "capture", "transient", "apply"}
+    ]
+
+
+def test_post_analysis_readiness_change_blocks_temporary_apply_and_transient_motion():
+    class StateChangingAdapter(ExperimentalAdapter):
+        def __init__(self):
+            super().__init__()
+            self.preflight_count = 0
+
+        def preflight(self, axes):
+            self.preflight_count += 1
+            super().preflight(axes)
+            if self.preflight_count == 2:
+                raise RuntimeError("printer started printing during analysis")
+
+    adapter = StateChangingAdapter()
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=experimental_analyzer,
+        experimental_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="started printing during analysis"):
+        plugin.calibrate(
+            ("X",), profile="experimental_mzv", repeats=3, validate=True
+        )
+
+    assert len([call for call in adapter.calls if call[0] == "capture"]) == 3
+    assert not [
+        call for call in adapter.calls if call[0] in {"apply", "transient"}
+    ]
+    assert adapter.calls[-1] == ("restore", SNAPSHOT)
+
+
 def test_parameterized_candidate_runs_full_validation_and_preserves_identifier():
     adapter = ExperimentalAdapter()
     plugin = AdvancedInputShaper(
@@ -1047,14 +1262,140 @@ def test_parameterized_candidate_runs_full_validation_and_preserves_identifier()
     )
     assert result.selections[0].shaper_type == "mzv(n=4,t=0.800000)"
     assert result.report["runtime_capability"]["passed"] is True
+    assert result.report["theoretical_spectral_non_regression"]["passed"] is True
+    assert result.report["theoretical_spectral_non_regression"]["validation"] is False
+    assert (
+        result.report["theoretical_spectral_non_regression"][
+            "held_out_validation_still_required"
+        ]
+        is True
+    )
+    assert result.report["runtime_capability"][
+        "configured_reference_model_proofs"
+    ][0]["shaper_type"] == "mzv"
+    assert result.report["runtime_capability"][
+        "selected_candidate_model_proofs"
+    ][0]["shaper_type"] == "mzv(n=4,t=0.800000)"
     assert result.report["validation"]["passed"] is True
-    captures = [call for call in adapter.calls if call[0] == "capture"]
-    assert len(captures) == 9
-    assert {call[4] for call in captures} == {30.25}
-    assert {call[6] for call in captures} == {0.10}
+    training = [call for call in adapter.calls if call[0] == "capture"]
+    transients = [call for call in adapter.calls if call[0] == "transient"]
+    assert len(training) == 3
+    assert len(transients) == 6
+    assert {call[4] for call in training} == {30.25}
+    assert {call[6] for call in training} == {0.10}
+    assert {call[7] for call in transients} == {"finite_reversal_ringdown"}
     plugin.apply("generalized-result")
     plugin.stage("generalized-result")
     assert adapter.calls[-1][0] == "stage"
+
+
+@pytest.mark.parametrize(
+    "evidence_kind", [None, "native_compatibility_validation_sweep"]
+)
+def test_experimental_boundary_rejects_passed_looking_non_transient_evidence(
+    evidence_kind,
+):
+    def wrong_evidence_analyzer(**kwargs):
+        result = experimental_analyzer(**kwargs)
+        if "validation_captures" in kwargs:
+            axis_evidence = result["validation"]["axes"]["X"]
+            if evidence_kind is None:
+                axis_evidence.pop("validation_evidence_kind", None)
+            else:
+                axis_evidence["validation_evidence_kind"] = evidence_kind
+        return result
+
+    adapter = ExperimentalAdapter()
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=wrong_evidence_analyzer,
+        experimental_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="not finite-ringdown evidence"):
+        plugin.calibrate(
+            ("X",), profile="experimental_mzv", repeats=3, validate=True
+        )
+
+    assert plugin.results == {}
+    assert adapter.calls[-1] == ("restore", SNAPSHOT)
+
+
+def test_theoretical_screen_rejection_blocks_all_held_out_motion_and_apply():
+    adapter = ExperimentalAdapter()
+    seen = {}
+
+    def rejecting_screen(**kwargs):
+        seen.update(kwargs)
+        return {
+            "passed": False,
+            "validation": False,
+            "held_out_validation_still_required": True,
+            "evidence_level": "theoretical_preflight_screen",
+            "reason": "X along_axis 125.0-130.0 Hz ratio 46.996 exceeds 1.100",
+            "axes": {"X": {"passed": False}},
+        }
+
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=experimental_analyzer,
+        spectral_screener=rejecting_screen,
+        experimental_enabled=True,
+        id_factory=lambda: "screen-rejected",
+    )
+
+    with pytest.raises(RuntimeError, match="theoretical spectral non-regression"):
+        plugin.calibrate(
+            ("X",), profile="experimental_mzv", repeats=3, validate=True
+        )
+
+    captures = [call for call in adapter.calls if call[0] == "capture"]
+    assert len(captures) == 3
+    assert all(call[3] is False for call in captures)
+    first_model_index = next(
+        index for index, call in enumerate(adapter.calls) if call[0] == "models"
+    )
+    first_capture_index = next(
+        index for index, call in enumerate(adapter.calls) if call[0] == "capture"
+    )
+    assert first_model_index < first_capture_index
+    assert not [call for call in adapter.calls if call[0] == "apply"]
+    assert adapter.calls[-1] == ("restore", SNAPSHOT)
+    assert plugin.status()["attempt_status"] == "rejected"
+    assert seen["reference_models"]["X"]["shaper_type"] == "mzv"
+    assert seen["candidate_models"]["X"]["shaper_type"] == (
+        "mzv(n=4,t=0.800000)"
+    )
+
+
+def test_mismatched_configured_reference_model_fails_before_motion_or_scv_change():
+    class MismatchedReferenceAdapter(ExperimentalAdapter):
+        def build_shaper_models(self, selections):
+            models = super().build_shaper_models(selections)
+            first = selections[0]
+            models[first.axis]["frequency_hz"] = first.frequency + 1.0
+            return models
+
+    adapter = MismatchedReferenceAdapter()
+    plugin = AdvancedInputShaper(
+        adapter=adapter,
+        analyzer=experimental_analyzer,
+        experimental_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="reference model does not exactly match"):
+        plugin.calibrate(
+            ("X",),
+            profile="experimental_mzv",
+            repeats=3,
+            validate=True,
+            square_corner_velocity=15.0,
+        )
+
+    assert not [
+        call for call in adapter.calls if call[0] in {"capture", "apply", "set_scv"}
+    ]
+    assert adapter.calls[-1] == ("restore", SNAPSHOT)
 
 
 @pytest.mark.parametrize("profile", ["experimental_mzv", "adaptive_stock"])

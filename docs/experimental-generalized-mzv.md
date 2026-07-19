@@ -61,15 +61,16 @@ or motion.
 Calling the optimizer directly still returns research-only candidates. The
 normal calibration pipeline promotes those candidates only under
 `PROFILE=experimental_mzv` or `PROFILE=adaptive_stock` when
-`enable_experimental_generalized_mzv: True`. Its full-confidence default
-requires three or more fitting/reference/candidate repeats. An explicit
-lower-confidence fast protocol uses one training sweep plus exactly two
-held-out reference and two candidate sweeps only with `FAST_VALIDATION=1`,
-`VALIDATE=1`, and `HZ_PER_SEC=2`; a held-out group is never reduced to one.
-Both protocols require measured modal damping, per-capture QC, a 95%
-attenuation confidence lower bound of at least 10%, no more than 5% cross-axis
-regression, exact runtime readback, and successful rollback. A rejection is
-never applyable or stageable.
+`enable_experimental_generalized_mzv: True`. Its full-confidence default uses
+three or more unshaped fitting sweeps and three held-out finite-reversal A/B
+ring-down pairs. An explicit lower-confidence fast protocol uses one training
+sweep plus exactly two A/B pairs only with `FAST_VALIDATION=1`, `VALIDATE=1`,
+and `HZ_PER_SEC=2`; a condition is never reduced to one capture. Both protocols
+require measured modal damping, per-window QC, a 95% attenuation confidence
+lower bound of at least 10%, no more than 5% cross-axis regression, exact
+runtime readback, paired sample-rate/duration fairness, measured total-band and
+meaningful 5-Hz-band non-regression on both commanded and cross axes, and
+successful rollback. A rejection is never applyable or stageable.
 
 `PROFILE=adaptive_stock` uses the same capability and validation protocol but
 places the exact native ZV, MZV, ZVD, EI, 2HUMP_EI, and 3HUMP_EI candidates in
@@ -84,11 +85,37 @@ duplicate, positional, mixed `t`/`tau`, signed, exponent, NaN, and infinite
 values are rejected. Reports, runtime apply, rollback snapshots, and staged
 configuration use the same canonical identifier.
 
+Experimental preflight requires raw per-axis Klippy shaper parameters. A build
+that exposes only rounded status cannot support an exact snapshot/rollback
+claim and therefore abstains before experimental motion.
+
 Current upstream also defines ZVD. ZVD is part of the exact-name allowlist, but
 the default native selection profiles are unchanged. The parameter schema is
 structured so a later, separately validated `ei(v_tol=...)` implementation can
 be added without opening arbitrary shaper arguments; `ei(v_tol=...)` is not
 runtime-exposed in this release.
+
+## Theory screen and measured promotion are different
+
+Before paired transient validation, the plugin compares the candidate with the
+exact configured baseline using installed-Klipper pulse definitions. It checks
+both the along- and cross-axis measured unshaped PSD and rejects a candidate
+that regresses in the worst meaningful 5-Hz band across measured damping
+uncertainty. This is a conservative **theory-only** non-regression screen. It
+does not validate attenuation, prove the C executor's internal state, establish
+a physical acceleration, or replace the paired ring-down test.
+
+Unshaped `TEST_RESONANCES` is training data. Experimental profiles do not use a
+shaped `TEST_RESONANCES INPUT_SHAPING=1` capture for promotion, ring-down
+validation, or an acceleration claim. The promotion protocol is
+`finite_reversal_ringdown_v1`: temporary reference and candidate shapers are
+read back through Klipper's Python status; the live enabled Klippy axis and its
+`n/A/T` arrays must match installed `shaper_defs.init_shaper` on non-empty
+input-shaper kinematics wrappers. A bounded finite reversal is then commanded,
+and raw post-command accelerometer windows are compared as interleaved A/B
+pairs. Each window must cover the complete requested 0.75-second interval to
+within the measured sample interval. These checks do not read back the private
+C executor structure.
 
 ## Non-inflating acceleration envelope
 

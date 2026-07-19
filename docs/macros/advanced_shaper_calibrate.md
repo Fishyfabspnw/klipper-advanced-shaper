@@ -28,12 +28,12 @@ Here are the available parameters:
 | --- | --- | --- |
 | `AXIS` | `ALL` | Axis to test: `X`, `Y`, or `ALL`. Testing both axes performs each axis workflow separately. |
 | `PROFILE` | `balanced` | Selection tradeoff: `quality`, `balanced`, `performance`, `experimental_mzv`, or `adaptive_stock`. The last two require the explicit config opt-in and mandatory validation. |
-| `REPEATS` | `3` | Captures per group. Experimental profiles require at least three. Fast validation requires `2` for each held-out group and intentionally uses one training sweep. |
-| `VALIDATE` | `1` | `1` performs held-out reference and candidate captures; `0` skips them. Experimental profiles always require `1`. |
+| `REPEATS` | `3` | Unshaped `TEST_RESONANCES` training sweeps. Experimental profiles require at least three. Fast validation uses one training sweep and exactly two transient A/B pairs. |
+| `VALIDATE` | `1` | `1` performs held-out finite-reversal raw ring-down A/B captures; `0` skips them. Experimental profiles always require `1`. |
 | `ACCEL_PER_HZ` | `CONFIG` | Free numeric excitation intensity: `CONFIG` or any unsigned decimal from `20` through `350` mm/s²/Hz. This is not a preset list. Higher is not automatically better and must pass the printer-specific motion-budget check. |
 | `HZ_PER_SEC` | `CONFIG` | Sweep rate: `CONFIG` or any unsigned decimal from `0.1` through `2` Hz/s. A faster rate shortens motion time but can reduce measurement confidence. |
 | `SCV` | `CONFIG` | Temporary square-corner velocity: `CONFIG` or any unsigned decimal from `0.1` through `50` mm/s. A numeric value is applied after the exact snapshot, verified by Klipper readback, used in smoothing calculations, reported, and restored exactly. |
-| `FAST_VALIDATION` | `0` | `1` selects the lower-confidence experimental protocol and requires exactly `REPEATS=2 VALIDATE=1 HZ_PER_SEC=2`. It runs one training plus two reference and two candidate sweeps; it does not remove QC, confidence, readback, cross-axis, or rollback gates. |
+| `FAST_VALIDATION` | `0` | `1` selects the lower-confidence experimental protocol and requires exactly `REPEATS=2 VALIDATE=1 HZ_PER_SEC=2`. It runs one training sweep plus two interleaved reference/candidate transient pairs; it does not remove QC, confidence, readback, cross-axis, or rollback gates. |
 | `PEAK_LOCK` | `0` | Experimental-only. `1` fixes generalized-MZV frequency to the strongest measured mode on that axis while still optimizing allowlisted pulse count and spacing. |
 
 > **Mainsail note**
@@ -64,10 +64,10 @@ explicit `adaptive_stock` profile.
 ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=175 HZ_PER_SEC=2 SCV=15 FAST_VALIDATION=1 PEAK_LOCK=1
 ```
 
-For a configured 5–135 Hz range, this commands approximately 5.4 minutes of
-resonance motion per axis. Probe movement, setup, status readback, analysis,
-rendering, and artifact I/O add time, so it is not a promise that the complete
-workflow finishes within seven minutes.
+This performs one unshaped training resonance sweep and four short transient
+captures per axis. Transient time depends on geometry, queued motion, sensor,
+and host timing, so it intentionally makes no complete-workflow wall-time
+promise.
 
 ## Reading the outcome
 
@@ -75,7 +75,8 @@ Do not judge a candidate from the tallest PSD peak or theoretical acceleration
 alone. Review:
 
 - capture QC and repeatability;
-- residual vibration and the 95% held-out attenuation confidence interval;
+- raw finite-reversal ring-down QC and the 95% paired attenuation confidence
+  interval;
 - cross-axis regression;
 - smoothing/path-error tradeoff;
 - exact applied-parameter readback and rollback status; and
@@ -87,3 +88,9 @@ guarantee higher mechanically safe acceleration or good print quality. An
 adaptive run can correctly keep the existing/native choice or reject every
 candidate. See [reading reports](../reports.md) for the graph and artifact
 reference.
+
+For the two experimental profiles, `TEST_RESONANCES` without shaping is training
+only, and a shaped `TEST_RESONANCES INPUT_SHAPING=1` capture is never the
+ring-down validation, promotion, or acceleration evidence. Klipper status plus
+the enabled live Klippy `n/A/T` arrays verify the temporary Python-layer shaper;
+they do not read back the private C executor structure.

@@ -72,8 +72,9 @@ that motion limit. The calculation is retained in the result report. Missing,
 invalid, or excessive values abort without a snapshot or capture. The capture
 command object overrides only `ACCEL_PER_HZ`; all other resonance recipe
 defaults continue to come from the running Klipper configuration. The same
-resolved value is used for training, held-out reference, and candidate sweeps,
-and the native recipe records the effective value in each capture.
+resolved value is used for training and, for experimental profiles, the
+associated validation session; the native recipe records it in each resonance
+capture.
 
 An explicit `SCV` override is separate from the resonance command recipe. The
 controller snapshots the original square-corner velocity first, sends a bounded
@@ -84,21 +85,22 @@ the original SCV on every exit path.
 Sweep rate is an orthogonal strict override. `HZ_PER_SEC=CONFIG` inherits the
 active `[resonance_tester]` value; explicit unsigned decimals are bounded to
 0.1..2 Hz/s. The capture preflight resolves and validates the effective rate,
-then the command boundary passes it unchanged to every capture. Reports retain
-the resolved rate, its source, sweep count, and estimated physical sweep time.
-The estimate explicitly excludes host analysis and artifact generation.
+then the command boundary passes it unchanged to every resonance capture.
+Reports retain the resolved rate and its source. Experimental transient
+validation has separate bounded-motion metadata and makes no wall-time promise.
 
-The default experimental validation protocol requires at least three training,
-three held-out reference, and three candidate repeats. Held-out captures are
-executed as readback-verified, within-axis A/B pairs: the exact snapshot shaper
-is applied and captured, then the exact candidate is applied and captured for
-the same pair ID before advancing. Reports retain the ordered capture ledger and
-pair IDs, and the paired bootstrap consumes the two lists in that order. The
-explicit fast mode is the sole exception: exactly two repeats per group,
-`VALIDATE=1`, and explicit
-`HZ_PER_SEC=2`. It remains a held-out 95% attenuation-confidence test with QC,
-cross-axis regression, exact readback, and rollback gates, but reports label it
-as lower confidence. One-repeat experimental validation remains forbidden.
+The default experimental protocol requires at least three unshaped training
+`TEST_RESONANCES` sweeps and three held-out transient A/B pairs. Training uses
+Klipper's normal behavior of disabling input shaping. Promotion evidence is
+instead a readback-verified finite-reversal command followed by a raw,
+post-command accelerometer ring-down window: the exact snapshot shaper is
+captured as A, then the exact candidate as B, for the same pair ID before
+advancing. Reports retain the ordered ledger and pair IDs, and the paired
+bootstrap consumes those raw windows in that order. The explicit fast mode is
+the sole exception: one training sweep and exactly two A/B pairs, `VALIDATE=1`,
+and explicit `HZ_PER_SEC=2`. It remains a held-out 95% attenuation-confidence
+test with QC, cross-axis regression, exact readback, and rollback gates, but is
+labeled lower confidence. One-repeat experimental validation remains forbidden.
 
 An optional `PEAK_LOCK=1` request is carried through the controller and analysis
 boundary only for the two experimental profiles. Analysis selects the highest-PSD
@@ -107,10 +109,12 @@ frequency search to that one exact bin. This changes candidate generation, not
 the validation or restoration protocol.
 
 Training sweeps use Klipper's normal behavior of temporarily disabling input
-shaping. Held-out reference and candidate sweeps retain their temporary native
-shapers, so acceptance compares the proposal against the shaper active when the
-session began. A candidate is never published when capture, analysis, artifact writing, or state
-restoration fails.
+shaping. Experimental profiles never use a shaped
+`TEST_RESONANCES INPUT_SHAPING=1` capture as ring-down validation, promotion
+evidence, or acceleration evidence; their promotion gate is the finite-reversal
+protocol. Ordinary profiles retain their existing native compatibility workflow.
+A candidate is never published when capture, analysis, artifact writing, or
+state restoration fails.
 
 For `adaptive_stock`, training-time cross-axis ranking is candidate-specific.
 Native candidates weight the measured cross-axis PSD by their exact upstream
@@ -119,17 +123,20 @@ with `oscillator_response` and report a conservative 95th-percentile residual
 over measured damping uncertainty. This modeled ranking signal never substitutes
 for the mandatory measured held-out cross-axis non-regression gate.
 
-The exact snapshot shaper is always the held-out A/reference condition, but it
-is not synthesized into the training candidate pool when Klipper's optimizer
-does not return that exact type-and-frequency tuple. Treating an optimized
-same-family row as the snapshot would be false parity. A future no-change
-candidate requires the capture bridge to obtain an exact-frequency score and
-response from the installed Klipper version; until then, rejection safely keeps
-the snapshot and no report claims that it was directly ranked.
+Before any held-out transient motion, experimental profiles run a theory-only
+spectral non-regression screen against the exact configured snapshot. It uses
+installed-Klipper pulse definitions, measured unshaped along- and cross-axis
+PSD, damping uncertainty, and the worst meaningful 5-Hz band. It is a
+fail-closed preflight screen, not a measured validation or physical-acceleration
+claim; the finite-reversal A/B ring-down gate still decides promotion.
 
 Parameterized identifiers pass through one strict parser shared by analysis and
-Klippy. Temporary application reads status back per axis before motion resumes;
-rollback uses and verifies the same canonical snapshot. Unsupported installed
+Klippy. Temporary application reads status back per axis before motion resumes.
+Experimental validation also requires an enabled live Klippy axis, non-empty
+input-shaper kinematics wrappers, and exact `n/A/T` agreement with installed
+`shaper_defs.init_shaper`. These are Python-layer and C-acceptance checks, not a
+C-struct executor readback. Rollback uses and verifies the same canonical
+snapshot. Unsupported installed
 Klipper builds abstain instead of substituting native MZV. The capability record
 includes the executor pulse capacity discovered from the installed Klipper
 source; optimization never emits a candidate above that capacity or the
@@ -148,5 +155,5 @@ does not install a custom executor.
 generalized MZV. The installed `shaper_defs` implementation must reproduce the
 expected generalized pulse sequence and expose a compatible executor capacity
 before any adaptive motion. Every temporary result is applied through
-`SET_INPUT_SHAPER`, read back from Klipper status, validated on held-out sweeps,
-and rolled back exactly.
+`SET_INPUT_SHAPER`, read back from Klipper status, validated with paired
+finite-reversal post-command ring-down captures, and rolled back exactly.

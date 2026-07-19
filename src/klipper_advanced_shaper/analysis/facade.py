@@ -26,6 +26,10 @@ from .statistics import attenuation_improvement_ci
 _MAX_NATIVE_BINS = 1024
 _MAX_SPECTROGRAM_FREQUENCIES = 256
 _MAX_SPECTROGRAM_TIMES = 192
+_MEASURED_BAND_WIDTH_HZ = 5.0
+_MEASURED_MEANINGFUL_FRACTION = 0.001
+_MEASURED_BAND_MAX_REGRESSION = 0.10
+_MEASURED_TOTAL_MAX_REGRESSION = 0.05
 
 
 def _samples(capture: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -464,6 +468,159 @@ def _energies(
     return along_energy, cross_energy, quality
 
 
+def _paired_transient_fairness(
+    references: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    pairs = []
+    for index, (reference, candidate) in enumerate(zip(references, candidates)):
+        reference_times, _ = _samples(reference)
+        candidate_times, _ = _samples(candidate)
+        reference_dt = float(np.median(np.diff(reference_times)))
+        candidate_dt = float(np.median(np.diff(candidate_times)))
+        reference_duration = float(reference_times[-1] - reference_times[0])
+        candidate_duration = float(candidate_times[-1] - candidate_times[0])
+        sample_rate_delta = abs(reference_dt - candidate_dt) / max(
+            reference_dt, candidate_dt
+        )
+        duration_delta = abs(reference_duration - candidate_duration)
+        duration_tolerance = 2.5 * max(reference_dt, candidate_dt)
+        pair_passed = (
+            np.isfinite(reference_dt)
+            and np.isfinite(candidate_dt)
+            and reference_dt > 0.0
+            and candidate_dt > 0.0
+            and sample_rate_delta <= 0.01
+            and duration_delta <= duration_tolerance
+        )
+        pairs.append(
+            {
+                "pair_index": index,
+                "reference_sample_rate_hz": 1.0 / reference_dt,
+                "candidate_sample_rate_hz": 1.0 / candidate_dt,
+                "relative_sample_interval_delta": sample_rate_delta,
+                "reference_duration_seconds": reference_duration,
+                "candidate_duration_seconds": candidate_duration,
+                "duration_delta_seconds": duration_delta,
+                "duration_tolerance_seconds": duration_tolerance,
+                "passed": bool(pair_passed),
+            }
+        )
+    return {
+        "passed": bool(pairs) and all(row["passed"] for row in pairs),
+        "sample_interval_relative_tolerance": 0.01,
+        "duration_tolerance_samples": 2.5,
+        "pairs": pairs,
+    }
+
+
+def _channel_non_regression(
+    references: Sequence[Spectrum],
+    candidates: Sequence[Spectrum],
+    *,
+    channel: str,
+) -> dict[str, Any]:
+    upper = min(
+        200.0,
+        *(float(item.frequencies[-1]) for item in references),
+        *(float(item.frequencies[-1]) for item in candidates),
+    )
+    if upper <= 5.0 + _MEASURED_BAND_WIDTH_HZ:
+        raise ValueError("held-out spectra do not cover the measured validation band")
+    total_band = (5.0, upper)
+    reference_total = np.asarray(
+        [integrated_band_energy(item, *total_band) for item in references], dtype=float
+    )
+    candidate_total = np.asarray(
+        [integrated_band_energy(item, *total_band) for item in candidates], dtype=float
+    )
+    scale = max(float(np.mean(reference_total)), float(np.mean(candidate_total)))
+    numerical_floor = max(scale * 64.0 * np.finfo(float).eps, np.finfo(float).tiny)
+    total_low, total_high = attenuation_improvement_ci(
+        np.maximum(reference_total, numerical_floor), candidate_total
+    )
+    bands = []
+    band_start = 5.0
+    while band_start < upper:
+        band_end = min(band_start + _MEASURED_BAND_WIDTH_HZ, upper)
+        try:
+            reference_energy = np.asarray(
+                [
+                    integrated_band_energy(item, band_start, band_end)
+                    for item in references
+                ],
+                dtype=float,
+            )
+            candidate_energy = np.asarray(
+                [
+                    integrated_band_energy(item, band_start, band_end)
+                    for item in candidates
+                ],
+                dtype=float,
+            )
+        except ValueError:
+            band_start = band_end
+            continue
+        meaningful_fraction = max(
+            float(np.mean(reference_energy))
+            / max(float(np.mean(reference_total)), numerical_floor),
+            float(np.mean(candidate_energy))
+            / max(float(np.mean(candidate_total)), numerical_floor),
+        )
+        if meaningful_fraction >= _MEASURED_MEANINGFUL_FRACTION:
+            low, high = attenuation_improvement_ci(
+                np.maximum(reference_energy, numerical_floor), candidate_energy
+            )
+            bands.append(
+                {
+                    "frequency_band_hz": [band_start, band_end],
+                    "meaningful_fraction": meaningful_fraction,
+                    "reference_energy_samples": reference_energy.tolist(),
+                    "candidate_energy_samples": candidate_energy.tolist(),
+                    "improvement_ci_95": [low, high],
+                    "minimum_allowed_improvement": -_MEASURED_BAND_MAX_REGRESSION,
+                    "passed": low >= -_MEASURED_BAND_MAX_REGRESSION,
+                }
+            )
+        band_start = band_end
+    worst = min(bands, key=lambda row: row["improvement_ci_95"][0]) if bands else None
+    return {
+        "channel": channel,
+        "frequency_range_hz": [5.0, upper],
+        "meaningful_fraction_threshold": _MEASURED_MEANINGFUL_FRACTION,
+        "band_width_hz": _MEASURED_BAND_WIDTH_HZ,
+        "numerical_floor": numerical_floor,
+        "total_reference_energy_samples": reference_total.tolist(),
+        "total_candidate_energy_samples": candidate_total.tolist(),
+        "total_improvement_ci_95": [total_low, total_high],
+        "total_minimum_allowed_improvement": -_MEASURED_TOTAL_MAX_REGRESSION,
+        "total_passed": total_low >= -_MEASURED_TOTAL_MAX_REGRESSION,
+        "meaningful_bands": bands,
+        "worst_meaningful_band": worst,
+        "passed": total_low >= -_MEASURED_TOTAL_MAX_REGRESSION
+        and all(row["passed"] for row in bands),
+    }
+
+
+def _measured_spectral_non_regression(
+    reference_along: Sequence[Spectrum],
+    candidate_along: Sequence[Spectrum],
+    reference_cross: Sequence[Spectrum],
+    candidate_cross: Sequence[Spectrum],
+) -> dict[str, Any]:
+    along = _channel_non_regression(
+        reference_along, candidate_along, channel="commanded_axis"
+    )
+    cross = _channel_non_regression(
+        reference_cross, candidate_cross, channel="cross_axis"
+    )
+    return {
+        "passed": bool(along["passed"] and cross["passed"]),
+        "evidence_level": "measured_held_out_finite_ringdown",
+        "channels": {"commanded_axis": along, "cross_axis": cross},
+    }
+
+
 def analyze_calibration(
     *,
     captures: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -516,6 +673,36 @@ def analyze_calibration(
                 shaped, shaped_cross, candidate_qc = _energies(
                     validation_captures[axis], axis, bands
                 )
+                reference_kinds = {
+                    str(capture.get("metadata", {}).get("validation_capture_kind", ""))
+                    for capture in held_out_captures[axis]
+                }
+                candidate_kinds = {
+                    str(capture.get("metadata", {}).get("validation_capture_kind", ""))
+                    for capture in validation_captures[axis]
+                }
+                finite_ringdown = (
+                    reference_kinds == {"finite_reversal_ringdown"}
+                    and candidate_kinds == {"finite_reversal_ringdown"}
+                )
+                fairness = None
+                measured_screen = None
+                if finite_ringdown:
+                    fairness = _paired_transient_fairness(
+                        held_out_captures[axis], validation_captures[axis]
+                    )
+                    reference_along_spectra, reference_cross_spectra, _ = (
+                        _axis_spectra(held_out_captures[axis], axis)
+                    )
+                    candidate_along_spectra, candidate_cross_spectra, _ = (
+                        _axis_spectra(validation_captures[axis], axis)
+                    )
+                    measured_screen = _measured_spectral_non_regression(
+                        reference_along_spectra,
+                        candidate_along_spectra,
+                        reference_cross_spectra,
+                        candidate_cross_spectra,
+                    )
             except (KeyError, TypeError, ValueError) as error:
                 details[axis] = {
                     "passed": False,
@@ -540,7 +727,12 @@ def analyze_calibration(
                 (np.mean(shaped_cross) - np.mean(baseline_cross))
                 / max(np.mean(baseline_cross), 1e-12)
             )
-            axis_passed = low >= 0.10 and cross_regression <= 0.05
+            axis_passed = (
+                low >= 0.10
+                and cross_regression <= 0.05
+                and (fairness is None or fairness["passed"])
+                and (measured_screen is None or measured_screen["passed"])
+            )
             passed = passed and axis_passed
             details[axis] = {
                 "energy_units": "acceleration_squared",
@@ -573,10 +765,24 @@ def analyze_calibration(
                     )
                 ],
                 "capture_design": (
-                    "paired_interleaved_ab"
+                    "paired_interleaved_ab_finite_reversal_ringdown"
+                    if explicit_pairing and finite_ringdown
+                    else "paired_interleaved_ab"
                     if explicit_pairing
                     else "paired_by_list_position_order_unverified"
                 ),
+                "validation_evidence_kind": (
+                    "finite_reversal_ringdown_v1"
+                    if finite_ringdown
+                    else "native_compatibility_validation_sweep"
+                ),
+                "energy_window": (
+                    "raw_accelerometer_post_command_ringdown"
+                    if finite_ringdown
+                    else "full_validation_capture"
+                ),
+                "paired_window_fairness": fairness,
+                "measured_spectral_non_regression": measured_screen,
                 "passed": axis_passed,
             }
         return {
@@ -585,7 +791,10 @@ def analyze_calibration(
                 "axes": details,
                 "reason": None
                 if passed
-                else "QC, 10% attenuation, or 5% cross-axis regression gate not met",
+                else (
+                    "QC, paired-window fairness, 10% modal attenuation, 5% "
+                    "cross-axis regression, or measured spectral non-regression gate not met"
+                ),
             }
         }
 
@@ -815,6 +1024,11 @@ def analyze_calibration(
                 "frequency_hz": aggregate.frequencies[::stride].tolist(),
                 "psd": aggregate.values[::stride].tolist(),
                 "relative_mad": mad[::stride].tolist(),
+            },
+            "cross_spectrum": {
+                "frequency_hz": cross_aggregate.frequencies[::stride].tolist(),
+                "psd": cross_aggregate.values[::stride].tolist(),
+                "definition": "sum_of_two_orthogonal_acceleration_psd_components",
             },
         }
     if profile == "adaptive_stock":

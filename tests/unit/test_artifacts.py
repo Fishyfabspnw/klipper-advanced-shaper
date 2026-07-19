@@ -229,6 +229,9 @@ def test_polished_report_has_decision_metrics_csv_and_no_network_assets(tmp_path
     assert "0.12" in validation_csv
     assert "mzv(n=4,t=0.800000)" in validation_csv
     assert "[10.0,14.0]" in validation_csv
+    assert "paired_window_fairness" in validation_csv
+    assert "measured_spectral_non_regression" in validation_csv
+    assert "meaningful 5-Hz-band non-regression" in rendered
 
 
 def test_validation_plot_is_axis_normalized_display_only_with_exact_labels():
@@ -351,6 +354,38 @@ def test_fast_validation_is_visibly_labeled_with_motion_only_timing(tmp_path):
     assert "5.4 min estimated motion/axis" in rendered
     assert "motion estimate excludes host analysis and artifact time" in rendered
     assert "readback-verified interleaved reference/candidate pairs" in rendered
+
+
+def test_experimental_transient_report_uses_ringdown_labels(tmp_path):
+    report = _complete_report()
+    report["validation_protocol"] = {
+        "mode": "fast_lower_confidence_1_train_2_held_out",
+        "lower_confidence": True,
+        "training_repeats": 1,
+        "reference_repeats": 2,
+        "candidate_repeats": 2,
+        "pair_count_per_axis": 2,
+        "promotion_gate": "finite_reversal_ringdown_v1",
+        "capture_design": "paired_interleaved_ab_finite_reversal_ringdown",
+        "estimated_motion_seconds_per_axis": 75.0,
+    }
+    report["validation"]["axes"]["X"].update({
+        "capture_design": "paired_interleaved_ab_finite_reversal_ringdown",
+        "validation_evidence_kind": "finite_reversal_ringdown_v1",
+        "energy_window": "raw_accelerometer_post_command_ringdown",
+    })
+
+    ArtifactWriter(tmp_path, keep_raw=False).write("transient", report)
+    rendered = (tmp_path / "transient" / "report.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "1 training sweep + 2 A/B transient pairs" in rendered
+    assert "Before / after held-out ring-down validation" in rendered
+    assert "Reference ring-down energy" in rendered
+    assert "Candidate ring-down energy" in rendered
+    assert "post-command ring-down modal-band energy" in rendered
+    assert "paired ring-down attenuation" in rendered
 
 
 def test_sparse_report_generates_all_visuals_with_pending_labels(tmp_path):

@@ -67,6 +67,89 @@ def _analysis_unavailable(**_: Any) -> Mapping[str, Any]:
     raise RuntimeError("analysis engine is unavailable")
 
 
+def _screen_unavailable(**_: Any) -> Mapping[str, Any]:
+    """Spawn-picklable fallback used when the spectral screen cannot load."""
+    raise RuntimeError("theoretical spectral non-regression screen is unavailable")
+
+
+def _model_proof_summary(models: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
+    keys = (
+        "axis",
+        "shaper_type",
+        "frequency_hz",
+        "design_damping_ratio",
+        "pulse_count",
+        "source",
+        "source_module",
+        "source_file",
+        "api_signature_verified",
+        "executor_pulse_limit",
+        "theoretical_model_only",
+        "live_c_executor_readback",
+    )
+    return [{key: model.get(key) for key in keys} for model in models.values()]
+
+
+def _assert_models_match_selections(
+    models: Mapping[str, Mapping[str, Any]],
+    selections: Sequence[ShaperSelection],
+    role: str,
+) -> None:
+    if set(models) != {selection.axis for selection in selections}:
+        raise RuntimeError("exact installed-Klipper %s models are incomplete" % role)
+    for selection in selections:
+        model = models[selection.axis]
+        try:
+            modeled_type = str(model["shaper_type"])
+            modeled_frequency = float(model["frequency_hz"])
+            modeled_damping = float(model["design_damping_ratio"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "%s-axis installed-Klipper %s model is malformed"
+                % (selection.axis, role)
+            ) from error
+        if (
+            modeled_type != selection.shaper_type
+            or not math.isclose(
+                modeled_frequency, selection.frequency, rel_tol=0.0, abs_tol=1e-9
+            )
+            or not math.isclose(
+                modeled_damping, selection.damping_ratio, rel_tol=0.0, abs_tol=1e-9
+            )
+        ):
+            raise RuntimeError(
+                "%s-axis installed-Klipper %s model does not exactly match selection"
+                % (selection.axis, role)
+            )
+
+
+def _require_transient_preflight(
+    proof: Any, axes: Sequence[str]
+) -> Mapping[str, Any]:
+    if (
+        not isinstance(proof, Mapping)
+        or proof.get("passed") is not True
+        or proof.get("protocol") != "finite_reversal_ringdown_v1"
+        or not isinstance(proof.get("plans"), Mapping)
+        or set(proof["plans"]) != set(axes)
+    ):
+        raise RuntimeError(
+            "finite transient validation preflight returned malformed proof"
+        )
+    try:
+        speed = float(proof["speed_mm_s"])
+        max_accel = float(proof["max_accel_mm_s2"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "finite transient validation preflight returned malformed proof"
+        ) from error
+    if not math.isfinite(speed) or speed <= 0.0 or not math.isfinite(max_accel) or max_accel <= 0.0:
+        raise RuntimeError(
+            "finite transient validation preflight returned malformed proof"
+        )
+    return proof
+
+
 @dataclass(frozen=True)
 class CalibrationResult:
     result_id: str
@@ -83,6 +166,7 @@ class AdvancedInputShaper:
         *,
         adapter: Optional[PrinterAdapter] = None,
         analyzer: Optional[Callable[..., Mapping[str, Any]]] = None,
+        spectral_screener: Optional[Callable[..., Mapping[str, Any]]] = None,
         id_factory: Optional[Callable[[], str]] = None,
         artifact_writer: Any = None,
         experimental_enabled: Optional[bool] = None,
@@ -93,6 +177,7 @@ class AdvancedInputShaper:
             adapter = KlipperPrinterAdapter(config)
         self.adapter = adapter
         self.analyzer = analyzer or self._load_default_analyzer()
+        self.spectral_screener = spectral_screener or self._load_default_screener()
         self.id_factory = id_factory or (lambda: uuid.uuid4().hex[:12])
         self.artifact_writer = artifact_writer
         self.worker = None
@@ -148,6 +233,17 @@ class AdvancedInputShaper:
             return analyze_calibration
         except (ImportError, AttributeError):
             return _analysis_unavailable
+
+    @staticmethod
+    def _load_default_screener() -> Callable[..., Mapping[str, Any]]:
+        try:
+            from klipper_advanced_shaper.analysis import (
+                theoretical_spectral_non_regression,
+            )
+
+            return theoretical_spectral_non_regression
+        except (ImportError, AttributeError):
+            return _screen_unavailable
 
     def _register_commands(self, gcode: Any) -> None:
         commands = {
@@ -226,8 +322,8 @@ class AdvancedInputShaper:
             "lower_confidence": fast_validation_enabled or (validate and repeats < 3),
             "repeats_per_group": repeats,
             "validation_enabled": bool(validate),
-            "full_sweeps_per_axis": (
-                training_repeats + reference_repeats + candidate_repeats
+            "full_sweeps_per_axis": training_repeats + (
+                0 if experimental_mode else reference_repeats + candidate_repeats
             ),
             "motion_time_excludes_host_analysis_and_artifact_time": True,
             "square_corner_velocity_source": (
@@ -248,15 +344,34 @@ class AdvancedInputShaper:
             }
             validation_protocol.update(
                 {
-                    "capture_design": "paired_interleaved_ab",
+                    "capture_design": (
+                        "paired_interleaved_ab_finite_reversal_ringdown"
+                        if experimental_mode
+                        else "paired_interleaved_ab"
+                    ),
                     "condition_labels": {"A": "reference", "B": "candidate"},
                     "pair_count_per_axis": repeats,
                     "total_pair_count": repeats * len(normalized_axes),
                     "pair_ids_by_axis": pair_ids_by_axis,
                     "capture_order": [],
-                    "temporary_apply_readback": "exact_status_before_every_capture",
+                    "temporary_apply_readback": (
+                        "exact_status_and_live_python_pulses_before_every_capture"
+                        if experimental_mode
+                        else "exact_status_before_every_capture"
+                    ),
                 }
             )
+            if experimental_mode:
+                validation_protocol.update(
+                    {
+                        "paired_transients_per_axis": (
+                            reference_repeats + candidate_repeats
+                        ),
+                        "promotion_gate": "finite_reversal_ringdown_v1",
+                        "filtered_sweep_screen": "diagnostic_only_non_promotional",
+                        "shaped_resonance_sweep_promotion_eligible": False,
+                    }
+                )
         else:
             pair_ids_by_axis = {}
         if fast_validation_enabled:
@@ -286,7 +401,10 @@ class AdvancedInputShaper:
         rejection_raw_groups: Optional[Mapping[str, Mapping[str, list[Any]]]] = None
         captures: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
         runtime_capability: Optional[Mapping[str, Any]] = None
+        reference_models: Optional[Mapping[str, Mapping[str, Any]]] = None
+        candidate_models: Optional[Mapping[str, Mapping[str, Any]]] = None
         excitation_preflight: Optional[Mapping[str, Any]] = None
+        transient_preflight: Optional[Mapping[str, Any]] = None
         executor_pulse_limit = 10
         try:
             capture_profile = getattr(self.adapter, "configure_capture_profile", None)
@@ -303,14 +421,39 @@ class AdvancedInputShaper:
             excitation_preflight = excitation_probe(
                 normalized_axes, selected_accel_per_hz, selected_hz_per_sec
             )
+            if validate and experimental_mode:
+                transient_probe = getattr(self.adapter, "preflight_transient", None)
+                if transient_probe is None:
+                    raise RuntimeError(
+                        "adapter cannot prove finite transient validation support"
+                    )
+                transient_preflight = _require_transient_preflight(
+                    transient_probe(normalized_axes), normalized_axes
+                )
             sweep_span = float(excitation_preflight["max_frequency_hz"]) - float(
                 excitation_preflight["min_frequency_hz"]
             )
             sweep_rate = float(excitation_preflight["hz_per_sec"])
             validation_protocol["estimated_motion_seconds_per_axis"] = (
-                validation_protocol["full_sweeps_per_axis"] * sweep_span / sweep_rate
+                (
+                    training_repeats * sweep_span / sweep_rate
+                    + (reference_repeats + candidate_repeats)
+                    * float(
+                        (transient_preflight or {}).get(
+                            "estimated_motion_seconds_per_capture_upper_bound", 0.0
+                        )
+                    )
+                )
+                if experimental_mode and validate
+                else validation_protocol["full_sweeps_per_axis"]
+                * sweep_span
+                / sweep_rate
             )
             validation_protocol["hz_per_sec"] = sweep_rate
+            if transient_preflight is not None:
+                validation_protocol["transient_preflight"] = dict(
+                    transient_preflight
+                )
             self.current_validation_protocol = dict(validation_protocol)
             if experimental_mode:
                 capability_probe = getattr(self.adapter, "preflight_experimental", None)
@@ -323,6 +466,33 @@ class AdvancedInputShaper:
             self.machine.checkpoint()
             snapshot = self.adapter.snapshot()
             analysis_snapshot = snapshot
+            snapshot_selections = tuple(
+                ShaperSelection(
+                    getattr(snapshot, "shaper_type_" + axis.lower()),
+                    getattr(snapshot, "shaper_freq_" + axis.lower()),
+                    axis,
+                    getattr(snapshot, "damping_ratio_" + axis.lower()),
+                )
+                for axis in normalized_axes
+            )
+            if experimental_mode:
+                model_builder = getattr(self.adapter, "build_shaper_models", None)
+                if model_builder is None:
+                    raise RuntimeError(
+                        "adapter cannot derive exact installed-Klipper reference models"
+                    )
+                reference_models = model_builder(snapshot_selections)
+                _assert_models_match_selections(
+                    reference_models, snapshot_selections, "reference"
+                )
+            if any(item.parameterized for item in snapshot_selections):
+                capability_probe = getattr(self.adapter, "preflight_experimental", None)
+                if capability_probe is None:
+                    raise RuntimeError("adapter cannot prove existing parameterized shaper support")
+                runtime_capability = capability_probe(
+                    snapshot_selections, max_vibrations=max_vibrations
+                )
+                executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             if selected_scv is not None:
                 scv_setter = getattr(
                     self.adapter, "set_test_square_corner_velocity", None
@@ -337,23 +507,6 @@ class AdvancedInputShaper:
                 analysis_snapshot.square_corner_velocity
             )
             self.current_validation_protocol = dict(validation_protocol)
-            snapshot_selections = tuple(
-                ShaperSelection(
-                    getattr(snapshot, "shaper_type_" + axis.lower()),
-                    getattr(snapshot, "shaper_freq_" + axis.lower()),
-                    axis,
-                    getattr(snapshot, "damping_ratio_" + axis.lower()),
-                )
-                for axis in normalized_axes
-            )
-            if any(item.parameterized for item in snapshot_selections):
-                capability_probe = getattr(self.adapter, "preflight_experimental", None)
-                if capability_probe is None:
-                    raise RuntimeError("adapter cannot prove existing parameterized shaper support")
-                runtime_capability = capability_probe(
-                    snapshot_selections, max_vibrations=max_vibrations
-                )
-                executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             self.machine.transition(CalibrationState.BASELINE_CAPTURE)
             for axis in normalized_axes:
                 for repeat in range(training_repeats):
@@ -419,11 +572,90 @@ class AdvancedInputShaper:
                 )
                 executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             report = dict(report)
+            if experimental_mode:
+                assert reference_models is not None
+                model_builder = getattr(self.adapter, "build_shaper_models", None)
+                if model_builder is None:
+                    raise RuntimeError(
+                        "adapter cannot derive exact installed-Klipper candidate models"
+                    )
+                candidate_models = model_builder(selections)
+                _assert_models_match_selections(
+                    candidate_models, selections, "candidate"
+                )
+                screen = self._invoke(
+                    self.spectral_screener,
+                    training_report=report,
+                    axes=normalized_axes,
+                    reference_models=reference_models,
+                    candidate_models=candidate_models,
+                )
+                if not isinstance(screen, Mapping) or screen.get("passed") not in {
+                    True,
+                    False,
+                }:
+                    raise RuntimeError(
+                        "theoretical spectral non-regression screen returned malformed evidence"
+                    )
+                report["theoretical_spectral_non_regression"] = dict(screen)
+                capability_details = dict(runtime_capability or {})
+                capability_details["configured_reference_model_proofs"] = (
+                    _model_proof_summary(reference_models)
+                )
+                capability_details["selected_candidate_model_proofs"] = (
+                    _model_proof_summary(candidate_models)
+                )
+                runtime_capability = capability_details
+                validation_protocol["theoretical_spectral_non_regression"] = {
+                    "required": True,
+                    "passed": bool(screen["passed"]),
+                    "evidence_level": "theoretical_preflight_screen",
+                    "held_out_validation_still_required": True,
+                }
+                self.current_validation_protocol = dict(validation_protocol)
+                if not screen["passed"]:
+                    rejection_error = RuntimeError(
+                        "candidate failed theoretical spectral non-regression screen: %s"
+                        % screen.get("reason", "meaningful-band regression")
+                    )
+                    report.update(
+                        {
+                            "runtime_capability": runtime_capability,
+                            "excitation_preflight": excitation_preflight,
+                            "validation_protocol": dict(validation_protocol),
+                            "attempt_id": attempt_id,
+                            "status": "rejected",
+                            "reason": str(rejection_error),
+                        }
+                    )
+                    rejection_report = report
+                    rejection_raw_groups = {"training": captures}
+                    raise rejection_error
             report["runtime_capability"] = runtime_capability
             report["excitation_preflight"] = excitation_preflight
             report["validation_protocol"] = dict(validation_protocol)
 
             if validate:
+                if experimental_mode:
+                    # Training sweeps and worker analysis yield control for long
+                    # enough that printer state and position must be proven again
+                    # before any temporary shaper application or held-out motion.
+                    self.adapter.preflight(normalized_axes)
+                    transient_probe = getattr(
+                        self.adapter, "preflight_transient", None
+                    )
+                    if transient_probe is None:
+                        raise RuntimeError(
+                            "adapter cannot prove finite transient validation support"
+                        )
+                    transient_preflight = _require_transient_preflight(
+                        transient_probe(normalized_axes), normalized_axes
+                    )
+                    validation_protocol["transient_preflight"] = dict(
+                        transient_preflight
+                    )
+                    validation_protocol["post_analysis_preflight_refreshed"] = True
+                    self.current_validation_protocol = dict(validation_protocol)
                 self.machine.transition(CalibrationState.TEMPORARY_VALIDATION)
                 reference = tuple(
                     ShaperSelection(
@@ -434,6 +666,79 @@ class AdvancedInputShaper:
                     )
                     for axis in normalized_axes
                 )
+                common_guards: dict[str, float] = {}
+                if experimental_mode:
+                    assert transient_preflight is not None
+                    accel_setter = getattr(self.adapter, "set_test_max_accel", None)
+                    if accel_setter is None:
+                        raise RuntimeError(
+                            "adapter cannot set and verify bounded transient acceleration"
+                        )
+                    accel_setter(float(transient_preflight["max_accel_mm_s2"]))
+                    validation_protocol["transient_motion_limit"] = {
+                        "max_accel_mm_s2": float(
+                            transient_preflight["max_accel_mm_s2"]
+                        ),
+                        "source": "finite_transient_preflight_cap",
+                        "readback_verified": True,
+                        "restored_from_exact_snapshot_in_finally": True,
+                    }
+                    model_builder = getattr(self.adapter, "build_shaper_models", None)
+                    if model_builder is None:
+                        raise RuntimeError(
+                            "adapter cannot derive exact transient pulse-span guards"
+                        )
+                    if reference_models is None:
+                        reference_models = model_builder(reference)
+                        _assert_models_match_selections(
+                            reference_models, reference, "reference"
+                        )
+                    if candidate_models is None:
+                        candidate_models = model_builder(selections)
+                        _assert_models_match_selections(
+                            candidate_models, selections, "candidate"
+                        )
+                    for axis in normalized_axes:
+                        try:
+                            reference_times = [
+                                float(value)
+                                for value in reference_models[axis]["pulse_times_s"]
+                            ]
+                            candidate_times = [
+                                float(value)
+                                for value in candidate_models[axis]["pulse_times_s"]
+                            ]
+                        except (KeyError, TypeError, ValueError) as error:
+                            raise RuntimeError(
+                                "%s-axis installed pulse timings are unavailable" % axis
+                            ) from error
+                        if not reference_times or not candidate_times:
+                            raise RuntimeError(
+                                "%s-axis installed pulse timings are empty" % axis
+                            )
+                        common_guards[axis] = max(
+                            max(reference_times) - min(reference_times),
+                            max(candidate_times) - min(candidate_times),
+                        ) + 0.020
+                    validation_protocol[
+                        "common_post_command_guard_seconds_by_axis"
+                    ] = dict(common_guards)
+                    validation_protocol["common_window_fairness"] = (
+                        "A and B discard the same longest pulse span plus 20 ms; "
+                        "initial response is intentionally excluded"
+                    )
+                    validation_protocol["estimated_motion_seconds_per_axis"] = (
+                        training_repeats * sweep_span / sweep_rate
+                        + (reference_repeats + candidate_repeats)
+                        * (
+                            float(
+                                transient_preflight[
+                                    "estimated_base_motion_seconds_per_capture_upper_bound"
+                                ]
+                            )
+                            + max(common_guards.values())
+                        )
+                    )
                 held_out: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
                 validation: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
                 capture_order: list[dict[str, Any]] = []
@@ -444,33 +749,110 @@ class AdvancedInputShaper:
                             ("candidate", selections, validation),
                         ):
                             self.machine.checkpoint()
+                            if experimental_mode:
+                                # Fail before SET_INPUT_SHAPER if printing,
+                                # homing, or readiness changed between A/B runs.
+                                self.adapter.preflight((axis,))
                             # KlipperPrinterAdapter.apply_temporary performs exact
                             # type/frequency/damping/axis status readback before
                             # this capture is allowed to start.
                             self.adapter.apply_temporary(active)
                             self.machine.checkpoint()
-                            destination[axis].append(
-                                self.adapter.capture(
+                            capture_row: dict[str, Any] = {
+                                "sequence": len(capture_order) + 1,
+                                "axis": axis,
+                                "pair_id": pair_id,
+                                "condition": condition,
+                                "condition_label": (
+                                    "A" if condition == "reference" else "B"
+                                ),
+                                "repeat_index": repeat,
+                            }
+                            if experimental_mode:
+                                pulse_verifier = getattr(
+                                    self.adapter, "verify_live_python_pulses", None
+                                )
+                                if pulse_verifier is None:
+                                    raise RuntimeError(
+                                        "adapter cannot prove live Python pulse state"
+                                    )
+                                pulse_proof = pulse_verifier(active)
+                                if (
+                                    not isinstance(pulse_proof, Mapping)
+                                    or pulse_proof.get("passed") is not True
+                                    or pulse_proof.get("live_c_executor_readback")
+                                    is not False
+                                    or axis not in pulse_proof.get("axes", {})
+                                ):
+                                    raise RuntimeError(
+                                        "%s-axis live Python pulse proof is malformed"
+                                        % axis
+                                    )
+                                try:
+                                    live_pulse_guard = float(
+                                        pulse_proof["axes"][axis][
+                                            "post_command_guard_seconds"
+                                        ]
+                                    )
+                                except (KeyError, TypeError, ValueError) as error:
+                                    raise RuntimeError(
+                                        "%s-axis live Python pulse guard is unavailable"
+                                        % axis
+                                    ) from error
+                                pulse_guard = float(common_guards[axis])
+                                if live_pulse_guard > pulse_guard + 1e-9:
+                                    raise RuntimeError(
+                                        "%s-axis live pulse span exceeds common paired guard"
+                                        % axis
+                                    )
+                                transient_capture = self.adapter.capture_transient(
                                     axis,
                                     repeat,
-                                    validation=True,
-                                    accel_per_hz=selected_accel_per_hz,
-                                    hz_per_sec=selected_hz_per_sec,
-                                    max_vibrations=max_vibrations,
-                                )
-                            )
-                            capture_order.append(
-                                {
-                                    "sequence": len(capture_order) + 1,
-                                    "axis": axis,
-                                    "pair_id": pair_id,
-                                    "condition": condition,
-                                    "condition_label": (
-                                        "A" if condition == "reference" else "B"
+                                    plan=transient_preflight["plans"][axis],
+                                    max_accel_mm_s2=float(
+                                        transient_preflight["max_accel_mm_s2"]
                                     ),
-                                    "repeat_index": repeat,
-                                }
-                            )
+                                    speed_mm_s=float(
+                                        transient_preflight["speed_mm_s"]
+                                    ),
+                                    post_command_guard_seconds=pulse_guard,
+                                )
+                                metadata = transient_capture.get("metadata", {})
+                                if (
+                                    not isinstance(metadata, Mapping)
+                                    or metadata.get("promotion_eligible") is not True
+                                    or metadata.get("protocol")
+                                    != "finite_reversal_ringdown_v1"
+                                    or metadata.get("validation_capture_kind")
+                                    != "finite_reversal_ringdown"
+                                ):
+                                    raise RuntimeError(
+                                        "%s-axis capture is not promotion-eligible "
+                                        "transient evidence" % axis
+                                    )
+                                destination[axis].append(transient_capture)
+                                capture_row.update(
+                                    {
+                                        "capture_kind": "finite_reversal_ringdown",
+                                        "post_command_guard_seconds": pulse_guard,
+                                        "live_python_pulse_proof": dict(pulse_proof),
+                                    }
+                                )
+                            else:
+                                destination[axis].append(
+                                    self.adapter.capture(
+                                        axis,
+                                        repeat,
+                                        validation=True,
+                                        accel_per_hz=selected_accel_per_hz,
+                                        hz_per_sec=selected_hz_per_sec,
+                                        max_vibrations=max_vibrations,
+                                    )
+                                )
+                                capture_row["capture_kind"] = (
+                                    "native_compatibility_validation_sweep"
+                                )
+                            capture_order.append(capture_row)
                             validation_protocol["capture_order"] = list(capture_order)
                             self.current_validation_protocol = dict(validation_protocol)
                 report["validation_protocol"] = dict(validation_protocol)
@@ -713,6 +1095,20 @@ class AdvancedInputShaper:
                 raise RuntimeError("%s generalized cross-axis regression is unsafe" % axis)
             if values.get("passed") is not True:
                 raise RuntimeError("%s generalized validation gate was not accepted" % axis)
+            if values.get("validation_evidence_kind") != "finite_reversal_ringdown_v1":
+                raise RuntimeError(
+                    "%s generalized validation is not finite-ringdown evidence" % axis
+                )
+            fairness = values.get("paired_window_fairness")
+            spectral = values.get("measured_spectral_non_regression")
+            if not isinstance(fairness, Mapping) or fairness.get("passed") is not True:
+                raise RuntimeError(
+                    "%s generalized paired-window fairness is insufficient" % axis
+                )
+            if not isinstance(spectral, Mapping) or spectral.get("passed") is not True:
+                raise RuntimeError(
+                    "%s generalized measured spectral non-regression is unsafe" % axis
+                )
 
     def cmd_ADV_SHAPER_CALIBRATE(self, gcmd: Any) -> None:
         axis = gcmd.get("AXIS", "ALL").upper()

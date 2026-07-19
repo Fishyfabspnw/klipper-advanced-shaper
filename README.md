@@ -50,6 +50,11 @@ Requirements: a working Klipper host, Python 3.9–3.11, Git, a configured
 `[resonance_tester]`, and a connected accelerometer supported by Klipper. Stop
 any print and leave the printer idle before installing or restarting Klipper.
 
+Ordinary native capture uses Klipper's configured accelerometer. Experimental
+finite-reversal promotion currently proves full-scale clipping limits only for
+ADXL345, LIS2DW, and LIS3DH identities. Other sensors abstain before transient
+motion instead of assuming a range.
+
 SSH into the Klipper host as the account that owns the Klipper installation,
 then run:
 
@@ -123,12 +128,12 @@ calibration parameters:
 | --- | --- | --- | --- |
 | `AXIS` | `X`, `Y`, or `ALL` | `ALL` | Calibrates one axis or X followed by Y. Every requested axis must be homed. |
 | `PROFILE` | `quality`, `balanced`, `performance`, `experimental_mzv`, or `adaptive_stock` | `balanced` | The first three retain the ordinary native analysis path. `experimental_mzv` searches only generalized MZV. `adaptive_stock` compares all six native families with generalized MZV. The last two require the explicit config opt-in and mandatory held-out validation. |
-| `REPEATS` | Integer `1` through `20` | `3` | Sweeps per group. Experimental profiles require at least three. Fast validation uses this required value of two for each held-out group and intentionally uses one training sweep. |
-| `VALIDATE` | `0` or `1` | `1` | Runs independent reference and candidate sweeps when `1`. It is mandatory for both experimental profiles. A `0` run is not physical performance evidence. |
+| `REPEATS` | Integer `1` through `20` | `3` | Unshaped `TEST_RESONANCES` training sweeps. Experimental profiles require at least three. Fast validation uses one training sweep and exactly two paired transient captures per condition. |
+| `VALIDATE` | `0` or `1` | `1` | When `1`, runs the mandatory finite-reversal, raw ring-down A/B validation for experimental profiles. It is not another resonance sweep. A `0` run is not physical performance evidence. |
 | `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal from `20` through `350` | `CONFIG` | Free numeric excitation control in mm/s^2/Hz—not presets. `CONFIG` inherits `[resonance_tester]`. The resolved value must pass the dynamic motion-budget check. |
 | `HZ_PER_SEC` | `CONFIG` or any unsigned decimal from `0.1` through `2` | `CONFIG` | Sweep rate in Hz/s. It changes commanded sweep time, not excitation intensity. |
 | `SCV` | `CONFIG` or any unsigned decimal from `0.1` through `50` | `CONFIG` | Temporary square-corner velocity in mm/s used by smoothing calculations. It is applied only after the exact printer snapshot, verified by readback, recorded in the report, and restored exactly. |
-| `FAST_VALIDATION` | `0` or `1` | `0` | Lower-confidence mode for the two experimental profiles only. `1` requires exactly `REPEATS=2`, `VALIDATE=1`, and explicit `HZ_PER_SEC=2`; it runs one training, two reference, and two candidate sweeps. |
+| `FAST_VALIDATION` | `0` or `1` | `0` | Lower-confidence mode for the two experimental profiles only. `1` requires exactly `REPEATS=2`, `VALIDATE=1`, and explicit `HZ_PER_SEC=2`; it runs one training sweep and two interleaved reference/candidate transient pairs. |
 | `PEAK_LOCK` | `0` or `1` | `0` | Experimental profiles only. `1` fixes generalized-MZV frequency to the strongest measured PSD mode for that axis; it does not weaken any validation gate. |
 
 Run calibration only while the printer is idle, clear of obstructions, and
@@ -166,9 +171,10 @@ effective inherited value must also be within 20..350.
 through 2 Hz/s inclusive, matching the installed upstream Klipper limit.
 `CONFIG` inherits `[resonance_tester]`. Signs, exponent notation, ambiguous
 leading zeroes, whitespace, non-finite values, junk, and out-of-range rates are
-rejected before motion. The resolved rate is passed to every training,
-held-out-reference, and candidate sweep and recorded in capture recipes and the
-result report.
+rejected before motion. The resolved rate is passed to every training sweep and
+recorded in its capture recipe and the result report. Experimental held-out
+validation uses finite reversals, not sweeps, so `HZ_PER_SEC` does not control
+those transient captures.
 
 Before snapshot or motion, the plugin computes the maximum pulse excitation as
 `max_freq * accel_per_hz`, adds Klipper's configured sweeping acceleration, and
@@ -198,7 +204,7 @@ fixes every generalized-MZV design considered for an axis to that axis's
 strongest measured PSD mode (the detected mode with the highest PSD amplitude),
 while still optimizing the strict allowlisted `n` and `t` parameters. The exact
 target frequency and strategy are recorded in the report. It does not skip
-capability preflight, held-out reference/candidate sweeps, exact status
+capability preflight, held-out reference/candidate transient captures, exact status
 readback, QC, confidence, cross-axis regression, or rollback.
 
 `APPLY` is runtime-only. `STAGE` writes the accepted stock-Klipper shaper type,
@@ -207,21 +213,20 @@ separately invoke `SAVE_CONFIG` to persist them. Neither command changes
 `[printer] max_accel`. Calibration never automatically applies, stages, saves,
 or changes heater, fan, motor-current, or persistent acceleration settings.
 
-With `REPEATS=3 VALIDATE=1`, each axis uses three fitting sweeps, three
-held-out sweeps using the shaper active at session start, and three sweeps using
-the proposed shaper. Experimental profiles require this full-confidence repeat
-count unless the explicit fast protocol is selected. Native profiles use the
-requested `REPEATS` value. To compare directly against a Shake&Tune result, apply
-that reference result for the runtime before starting the session. The
-candidate is accepted only when the 95% confidence interval demonstrates at
-least 10% resonant-band attenuation. Every temporary setting is restored before
-the result becomes reviewable.
+For experimental profiles with `REPEATS=3 VALIDATE=1`, each axis uses three unshaped fitting
+`TEST_RESONANCES` sweeps followed by three interleaved A/B finite-reversal
+ring-down pairs. Each pair captures the exact configured reference and the
+temporary candidate with raw accelerometer windows after the command. The
+candidate is accepted only when paired QC and window fairness, the modal
+attenuation confidence interval, cross-axis regression, and measured total-band
+and meaningful 5-Hz-band non-regression all pass; every temporary setting is
+restored before a result becomes reviewable. `ACCEL_PER_HZ` changes excitation
+intensity, not sweep duration.
 
-The full-confidence validated workflow (`REPEATS=3 VALIDATE=1`) performs nine
-full resonance sweeps per axis: three training, three held-out reference, and
-three candidate sweeps. `AXIS=ALL` performs 18 total sweeps. `ACCEL_PER_HZ`
-changes excitation intensity, not sweep duration; duration is primarily set by
-the configured frequency range and `HZ_PER_SEC`.
+The full-confidence experimental workflow has three training resonance sweeps
+and six short transient validation captures per axis. `AXIS=ALL` repeats that
+per-axis workflow. It must not be described as nine or eighteen resonance
+sweeps: the transient captures are separate finite-reversal ring-down evidence.
 
 For `experimental_mzv`, an explicit lower-confidence fast path is available:
 
@@ -235,14 +240,14 @@ The same bounded protocol can run the cross-family stock-compatible search:
 ADV_SHAPER_CALIBRATE AXIS=ALL PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=175 HZ_PER_SEC=2 SCV=15 FAST_VALIDATION=1 PEAK_LOCK=1
 ```
 
-This performs one training, two held-out reference, and two candidate sweeps.
-For a 5–135 Hz range, the five commanded sweeps are approximately 5.4 minutes of
-resonance motion per axis at 2 Hz/s. This is not a promise that the complete
-axis workflow finishes within 5.4 or 7 minutes: movement between probe points,
-sensor setup, status checks, host analysis, report rendering, and artifact I/O
-add elapsed time. The faster rate and two-repeat confidence interval trade
-spectral and statistical confidence for time; all QC, 95% attenuation CI,
-cross-axis regression, exact readback, and rollback gates remain fail-closed.
+This performs one unshaped training resonance sweep, then two short,
+interleaved reference/candidate finite-reversal ring-down pairs. The raw
+accelerometer windows are the promotion evidence; they are not resonance sweeps.
+The transient time depends on printer geometry, queued-motion timing, sensor,
+and host, so no wall-time promise is made. The faster rate and two-repeat
+confidence interval trade spectral and statistical confidence for time; all QC,
+95% attenuation CI, cross-axis regression, exact readback, and rollback gates
+remain fail-closed.
 `FAST_VALIDATION=1` never reduces either held-out group below two captures,
 accepts neither one nor three for `REPEATS`, requires explicit
 `HZ_PER_SEC=2`, and never makes a rejected result eligible for apply or stage.
@@ -269,15 +274,20 @@ the config opt-in shown above, `VALIDATE=1`, and either the full-confidence or
 explicit fast repeat protocol. Before any experimental sweep, the plugin probes
 the installed `shaper_defs` implementation and generic executor. Current stock
 Klipper builds that provide the required allowlisted APIs work without core
-patches. Older, incompatible, or vendor-modified builds abstain; there is no
-silent compatibility fallback. These two profiles also ask upstream Klipper's
+patches. Experimental preflight also requires raw per-axis Klippy parameters;
+a rounded status-only interface cannot support exact snapshot restoration.
+Older, incompatible, or vendor-modified builds abstain; there is no silent
+compatibility fallback. These two profiles also ask upstream Klipper's
 native fitter for a profile-derived `max_vibrations` limit (currently 10%).
 That is a per-family frequency-fitting constraint, not the separate held-out
 10% attenuation-improvement gate; ordinary profiles omit it and retain legacy
 native fitting. Installed Klipper must explicitly support the parameter or
 preflight abstains before motion. After every temporary `SET_INPUT_SHAPER`,
 Klipper status must read back the exact canonical axis, identifier, frequency,
-and damping before validation can continue.
+and damping before validation can continue. Experimental validation additionally
+checks the live Klippy axis state is enabled and that its `n/A/T` pulse arrays
+match the installed `shaper_defs.init_shaper` result on active kinematics. This
+is still not a readback of Klipper's private C executor structure.
 
 A candidate rejected by held-out validation is never available to `APPLY` or
 `STAGE`. After the original printer state has been restored successfully, its

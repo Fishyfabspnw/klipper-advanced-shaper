@@ -14,6 +14,14 @@ from klipper_advanced_shaper.shapers import NATIVE_SHAPER_ORDER
 from .excitation import check_motion_budget, check_sweep_rate
 
 _MAX_REPORT_FREQUENCY_BINS = 1024
+_TRANSIENT_HALF_TRAVEL_MM = 4.0
+_TRANSIENT_EDGE_MARGIN_MM = 1.0
+_TRANSIENT_SPEED_MM_S = 80.0
+_TRANSIENT_MAX_ACCEL_MM_S2 = 5000.0
+_TRANSIENT_SETTLE_SECONDS = 0.25
+_TRANSIENT_RINGDOWN_SECONDS = 0.75
+_TRANSIENT_MIN_SAMPLES = 128
+_KNOWN_16G_SENSOR_TOKENS = ("adxl345", "lis2dw", "lis3dh")
 
 
 def _bounded_indices(size: int, limit: int = _MAX_REPORT_FREQUENCY_BINS) -> np.ndarray:
@@ -261,6 +269,410 @@ class NativeResonanceCaptureProvider:
         return result
 
     @staticmethod
+    def _require_bound_call(target: Any, name: str, *arguments: Any) -> Any:
+        method = getattr(target, name, None)
+        if method is None or not callable(method):
+            raise RuntimeError("stock Klipper %s API is unavailable" % name)
+        try:
+            inspect.signature(method).bind(*arguments)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("unsupported stock Klipper %s API" % name) from error
+        return method
+
+    @staticmethod
+    def _coordinate_component(value: Any, axis: str) -> float:
+        index = 0 if axis == "X" else 1
+        try:
+            component = getattr(value, axis.lower())
+        except AttributeError:
+            try:
+                component = value[index]
+            except (IndexError, KeyError, TypeError) as error:
+                raise RuntimeError(
+                    "Klipper kinematics did not expose %s-axis bounds" % axis
+                ) from error
+        try:
+            result = float(component)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Klipper kinematics returned an invalid %s-axis bound" % axis
+            ) from error
+        if not np.isfinite(result):
+            raise RuntimeError(
+                "Klipper kinematics returned a non-finite %s-axis bound" % axis
+            )
+        return result
+
+    def _transient_chips(self, axis: str) -> list[tuple[str, Any]]:
+        tester = self._tester()
+        matches = [
+            (str(chip_axis), chip)
+            for chip_axis, chip in getattr(tester, "accel_chips", ())
+            if axis.lower() in str(chip_axis).lower()
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "%s-axis transient validation requires exactly one matching "
+                "accelerometer, found %d" % (axis, len(matches))
+            )
+        chip_axis, chip = matches[0]
+        self._require_bound_call(chip, "start_internal_client")
+        if not getattr(chip, "name", None):
+            raise RuntimeError("transient accelerometer has no stable Klipper name")
+        return [(chip_axis, chip)]
+
+    @staticmethod
+    def _transient_clip_limit(chip: Any) -> float:
+        identity = " ".join(
+            (
+                str(getattr(chip, "name", "")),
+                type(chip).__name__,
+                type(chip).__module__,
+            )
+        ).lower()
+        if not any(token in identity for token in _KNOWN_16G_SENSOR_TOKENS):
+            raise RuntimeError(
+                "transient accelerometer full-scale range cannot be proven"
+            )
+        return 16.0 * 9.80665 * 1000.0
+
+    def preflight_transient(self, axes: tuple[str, ...]) -> dict[str, Any]:
+        """Prove and plan a short, bounded stock-toolhead reversal transient.
+
+        This intentionally uses only Klipper's Python toolhead and accelerometer
+        interfaces.  It does not inspect or claim readback from the C executor.
+        """
+        if not axes or any(axis not in {"X", "Y"} for axis in axes):
+            raise RuntimeError("transient validation supports only X and Y")
+        toolhead = self.printer.lookup_object("toolhead", None)
+        if toolhead is None:
+            raise RuntimeError("stock Klipper toolhead is unavailable")
+        self._require_bound_call(toolhead, "get_position")
+        self._require_bound_call(toolhead, "get_last_move_time")
+        self._require_bound_call(toolhead, "manual_move", [None, None], 1.0)
+        self._require_bound_call(toolhead, "wait_moves")
+        self._require_bound_call(toolhead, "dwell", 0.1)
+
+        eventtime = self.printer.get_reactor().monotonic()
+        status = toolhead.get_status(eventtime)
+        kinematics = toolhead.get_kinematics()
+        kinematics_status = kinematics.get_status(eventtime)
+        try:
+            current = list(toolhead.get_position())
+            max_velocity = float(status["max_velocity"])
+            configured_max_accel = float(status["max_accel"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Klipper toolhead motion limits are unavailable for transient validation"
+            ) from error
+        if len(current) < 2 or any(not np.isfinite(float(value)) for value in current[:2]):
+            raise RuntimeError("Klipper toolhead position is invalid")
+        if (
+            not np.isfinite(max_velocity)
+            or not np.isfinite(configured_max_accel)
+            or max_velocity <= 0.0
+            or configured_max_accel <= 0.0
+        ):
+            raise RuntimeError("Klipper toolhead motion limits are invalid")
+
+        speed = min(_TRANSIENT_SPEED_MM_S, max_velocity)
+        if speed < 10.0:
+            raise RuntimeError("printer max_velocity is too low for transient validation")
+        target_accel = min(_TRANSIENT_MAX_ACCEL_MM_S2, configured_max_accel)
+        plans: dict[str, Any] = {}
+        for axis in axes:
+            _chip_axis, chip = self._transient_chips(axis)[0]
+            clip_limit = self._transient_clip_limit(chip)
+            index = 0 if axis == "X" else 1
+            minimum = self._coordinate_component(
+                kinematics_status.get("axis_minimum"), axis
+            )
+            maximum = self._coordinate_component(
+                kinematics_status.get("axis_maximum"), axis
+            )
+            usable_minimum = minimum + _TRANSIENT_EDGE_MARGIN_MM
+            usable_maximum = maximum - _TRANSIENT_EDGE_MARGIN_MM
+            if usable_maximum - usable_minimum < 2.0 * _TRANSIENT_HALF_TRAVEL_MM:
+                raise RuntimeError(
+                    "%s-axis travel is too small for bounded transient validation" % axis
+                )
+            anchor = min(
+                max(float(current[index]), usable_minimum + _TRANSIENT_HALF_TRAVEL_MM),
+                usable_maximum - _TRANSIENT_HALF_TRAVEL_MM,
+            )
+            start = anchor - _TRANSIENT_HALF_TRAVEL_MM
+            reversal = anchor + _TRANSIENT_HALF_TRAVEL_MM
+            if not usable_minimum <= start < reversal <= usable_maximum:
+                raise RuntimeError(
+                    "%s-axis transient geometry is outside kinematic limits" % axis
+                )
+            plans[axis] = {
+                "axis": axis,
+                "original_position_mm": float(current[index]),
+                "anchor_position_mm": anchor,
+                "start_position_mm": start,
+                "reversal_position_mm": reversal,
+                "return_position_mm": start,
+                "half_travel_mm": _TRANSIENT_HALF_TRAVEL_MM,
+                "transient_excitation_travel_mm": 4.0 * _TRANSIENT_HALF_TRAVEL_MM,
+                "approach_travel_mm": abs(float(current[index]) - start),
+                "position_restore_travel_mm": abs(start - float(current[index])),
+                "total_capture_travel_mm": (
+                    4.0 * _TRANSIENT_HALF_TRAVEL_MM
+                    + 2.0 * abs(float(current[index]) - start)
+                ),
+                "axis_minimum_mm": minimum,
+                "axis_maximum_mm": maximum,
+                "edge_margin_mm": _TRANSIENT_EDGE_MARGIN_MM,
+                "sensor_name": str(chip.name),
+                "clip_limit": clip_limit,
+            }
+        return {
+            "passed": True,
+            "protocol": "finite_reversal_ringdown_v1",
+            "promotion_role": "mandatory_paired_held_out_validation",
+            "stock_klipper_python_interfaces_only": True,
+            "motion_planner_modified": False,
+            "live_c_executor_readback": False,
+            "speed_mm_s": speed,
+            "max_accel_mm_s2": target_accel,
+            "settle_seconds": _TRANSIENT_SETTLE_SECONDS,
+            "ringdown_seconds": _TRANSIENT_RINGDOWN_SECONDS,
+            "estimated_base_motion_seconds_per_capture_upper_bound": 4.0,
+            "maximum_supported_post_command_guard_seconds": 10.0,
+            "estimated_motion_seconds_per_capture_upper_bound": 14.0,
+            "plans": plans,
+        }
+
+    def capture_transient(
+        self,
+        axis: str,
+        repeat: int,
+        plan: Any,
+        max_accel_mm_s2: Any,
+        speed_mm_s: Any,
+        post_command_guard_seconds: Any = 0.0,
+    ) -> dict[str, Any]:
+        """Capture raw post-command ring-down after a finite reversal."""
+        axis = str(axis).upper()
+        preflight = self.preflight_transient((axis,))
+        try:
+            start = float(plan["start_position_mm"])
+            reversal = float(plan["reversal_position_mm"])
+            returned = float(plan["return_position_mm"])
+            original = float(plan["original_position_mm"])
+            anchor = float(plan["anchor_position_mm"])
+            expected_accel = float(max_accel_mm_s2)
+            speed = float(speed_mm_s)
+            guard = float(post_command_guard_seconds)
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("transient validation plan is malformed") from error
+        current_plan = preflight["plans"][axis]
+        if abs(float(current_plan["original_position_mm"]) - original) > 0.001:
+            raise RuntimeError(
+                "%s-axis position changed after transient validation preflight" % axis
+            )
+        for name in (
+            "anchor_position_mm", "start_position_mm", "reversal_position_mm",
+            "return_position_mm",
+        ):
+            if abs(float(current_plan[name]) - float(plan[name])) > 1e-9:
+                raise RuntimeError("transient validation plan is stale")
+        minimum = float(current_plan["axis_minimum_mm"])
+        maximum = float(current_plan["axis_maximum_mm"])
+        if not minimum <= original <= maximum:
+            raise RuntimeError("transient original position is outside current axis limits")
+        for value in (anchor, start, reversal, returned):
+            if not (
+                minimum + _TRANSIENT_EDGE_MARGIN_MM
+                <= value
+                <= maximum - _TRANSIENT_EDGE_MARGIN_MM
+            ):
+                raise RuntimeError("transient validation plan is outside current axis limits")
+        if returned != start or reversal <= start:
+            raise RuntimeError("transient validation plan is not a finite reversal")
+        if abs((reversal - start) - 2.0 * _TRANSIENT_HALF_TRAVEL_MM) > 1e-9:
+            raise RuntimeError("transient validation plan has unexpected geometry")
+        if (
+            not np.isfinite(expected_accel)
+            or expected_accel <= 0.0
+            or expected_accel > _TRANSIENT_MAX_ACCEL_MM_S2
+        ):
+            raise RuntimeError("transient validation acceleration is unsafe")
+        if (
+            not np.isfinite(speed)
+            or speed < 10.0
+            or speed > min(_TRANSIENT_SPEED_MM_S, preflight["speed_mm_s"])
+        ):
+            raise RuntimeError("transient validation speed is unsafe")
+        if not np.isfinite(guard) or not 0.0 <= guard <= 10.0:
+            raise RuntimeError("transient post-command guard is unsafe")
+
+        toolhead = self.printer.lookup_object("toolhead")
+        eventtime = self.printer.get_reactor().monotonic()
+        actual_accel = float(toolhead.get_status(eventtime)["max_accel"])
+        if abs(actual_accel - expected_accel) > 0.0005:
+            raise RuntimeError(
+                "transient max_accel readback mismatch: expected %.6f, got %.6f"
+                % (expected_accel, actual_accel)
+            )
+
+        _chip_axis, chip = self._transient_chips(axis)[0]
+        clip_limit = self._transient_clip_limit(chip)
+        if (
+            str(chip.name) != str(plan.get("sensor_name"))
+            or abs(clip_limit - float(plan.get("clip_limit", float("nan")))) > 1e-9
+        ):
+            raise RuntimeError("transient accelerometer changed after preflight")
+        client = chip.start_internal_client()
+        for name in ("finish_measurements", "has_valid_samples", "get_samples"):
+            self._require_bound_call(client, name)
+        finished = False
+        position_may_have_changed = False
+        try:
+            coordinate = [None, None]
+            coordinate[0 if axis == "X" else 1] = start
+            toolhead.manual_move(coordinate, speed)
+            position_may_have_changed = True
+            toolhead.wait_moves()
+            toolhead.dwell(_TRANSIENT_SETTLE_SECONDS)
+            transient_start = float(toolhead.get_last_move_time())
+
+            coordinate[0 if axis == "X" else 1] = reversal
+            toolhead.manual_move(coordinate, speed)
+            coordinate[0 if axis == "X" else 1] = returned
+            toolhead.manual_move(coordinate, speed)
+            motion_end = float(toolhead.get_last_move_time())
+            if not np.isfinite(motion_end) or motion_end <= transient_start:
+                raise RuntimeError("Klipper did not queue the transient motion")
+            # Klipper's toolhead print_time marks the nominal trapq command end,
+            # not a public C-executor tail timestamp.  Wait through the complete
+            # installed Python pulse span supplied by the post-SET pulse proof,
+            # plus its conservative margin, before starting the ring-down window.
+            toolhead.dwell(guard + _TRANSIENT_RINGDOWN_SECONDS)
+            capture_end = float(toolhead.get_last_move_time())
+            client.finish_measurements()
+            finished = True
+        finally:
+            if not finished:
+                try:
+                    client.finish_measurements()
+                except Exception:
+                    pass
+            if position_may_have_changed:
+                coordinate = [None, None]
+                coordinate[0 if axis == "X" else 1] = original
+                toolhead.manual_move(coordinate, speed)
+                toolhead.wait_moves()
+        position_after = float(toolhead.get_position()[0 if axis == "X" else 1])
+        if abs(position_after - original) > 0.001:
+            raise RuntimeError(
+                "%s-axis transient position restore mismatch: expected %.6f, got %.6f"
+                % (axis, original, position_after)
+            )
+        if not client.has_valid_samples():
+            raise RuntimeError("transient accelerometer measured no valid data")
+        samples = np.asarray(client.get_samples(), dtype=float)
+        if (
+            samples.ndim != 2
+            or samples.shape[1] != 4
+            or samples.shape[0] < _TRANSIENT_MIN_SAMPLES
+            or not np.all(np.isfinite(samples))
+            or np.any(np.diff(samples[:, 0]) <= 0.0)
+        ):
+            raise RuntimeError("transient accelerometer samples are malformed")
+        sample_interval = float(np.median(np.diff(samples[:, 0])))
+        if not np.isfinite(sample_interval) or sample_interval <= 0.0:
+            raise RuntimeError("transient accelerometer sample interval is invalid")
+        requested_start = motion_end + guard
+        requested_end = capture_end
+        window = samples[
+            (samples[:, 0] >= requested_start) & (samples[:, 0] <= requested_end)
+        ]
+        if window.shape[0] < _TRANSIENT_MIN_SAMPLES:
+            raise RuntimeError("post-command transient ring-down window is incomplete")
+        start_offset = float(window[0, 0] - requested_start)
+        end_offset = float(requested_end - window[-1, 0])
+        boundary_tolerance = 2.5 * sample_interval
+        if (
+            start_offset < -1e-12
+            or end_offset < -1e-12
+            or start_offset > boundary_tolerance
+            or end_offset > boundary_tolerance
+            or float(window[-1, 0] - window[0, 0])
+            < _TRANSIENT_RINGDOWN_SECONDS - 2.0 * boundary_tolerance
+        ):
+            raise RuntimeError("post-command transient ring-down window is incomplete")
+        sample_rate = 1.0 / float(np.median(np.diff(window[:, 0])))
+        if not np.isfinite(sample_rate) or not 100.0 <= sample_rate <= 10000.0:
+            raise RuntimeError("transient accelerometer sample rate is invalid")
+        return {
+            "samples": window,
+            "axis": axis,
+            "repeat": int(repeat),
+            "validation": True,
+            "native_candidates": [],
+            "native_spectrum": {
+                "available": False,
+                "reason": "finite transient uses raw post-command samples",
+            },
+            "metadata": {
+                "validation_capture_kind": "finite_reversal_ringdown",
+                "protocol": "finite_reversal_ringdown_v1",
+                "promotion_eligible": True,
+                "sample_semantics": "raw_accelerometer_post_command_ringdown",
+                "timebase": "accelerometer_timestamps_aligned_to_toolhead_print_time",
+                "transient_start_time": transient_start,
+                "command_end_time": motion_end,
+                "post_command_guard_seconds": guard,
+                "post_command_guard_basis": (
+                    "full_live_python_pulse_span_plus_conservative_margin"
+                ),
+                "ringdown_window_start_time": float(window[0, 0]),
+                "ringdown_window_end_time": float(window[-1, 0]),
+                "ringdown_requested_start_time": requested_start,
+                "ringdown_requested_end_time": requested_end,
+                "ringdown_start_offset_seconds": start_offset,
+                "ringdown_end_offset_seconds": end_offset,
+                "ringdown_boundary_tolerance_seconds": boundary_tolerance,
+                "ringdown_duration_seconds": float(window[-1, 0] - window[0, 0]),
+                "sample_rate_hz": sample_rate,
+                "ringdown_sample_count": int(window.shape[0]),
+                "full_capture_sample_count": int(samples.shape[0]),
+                "sensor_names": [str(chip.name)],
+                "clip_limit": clip_limit,
+                "pre_capture_axis_position_mm": original,
+                "post_capture_axis_position_mm": position_after,
+                "position_restore_tolerance_mm": 0.001,
+                "position_restored": True,
+                "motion_recipe": {
+                    "axis": axis,
+                    "original_position_mm": original,
+                    "anchor_position_mm": anchor,
+                    "start_position_mm": start,
+                    "reversal_position_mm": reversal,
+                    "return_position_mm": returned,
+                    "speed_mm_s": speed,
+                    "max_accel_mm_s2": expected_accel,
+                    "settle_seconds": _TRANSIENT_SETTLE_SECONDS,
+                    "ringdown_seconds": _TRANSIENT_RINGDOWN_SECONDS,
+                    "post_command_guard_seconds": guard,
+                    "transient_excitation_travel_mm": 2.0 * (reversal - start),
+                    "approach_travel_mm": abs(original - start),
+                    "position_restore_travel_mm": abs(start - original),
+                    "total_capture_travel_mm": (
+                        2.0 * (reversal - start) + 2.0 * abs(original - start)
+                    ),
+                },
+                "cross_axis_channels_retained": True,
+                "qc_required": True,
+                "stock_klipper_python_interfaces_only": True,
+                "motion_planner_modified": False,
+                "live_c_executor_readback": False,
+            },
+        }
+
+    @staticmethod
     def _validate_max_vibrations(value: Any) -> float:
         try:
             threshold = float(value)
@@ -410,5 +822,12 @@ class NativeResonanceCaptureProvider:
             result["metadata"][
                 "native_fitting_status"
             ] = "skipped_held_out_validation"
+            result["metadata"][
+                "validation_capture_kind"
+            ] = "native_compatibility_validation_sweep"
+            result["metadata"]["experimental_promotion_eligible"] = False
+            result["metadata"][
+                "experimental_promotion_exclusion_reason"
+            ] = "experimental profiles require finite-reversal ring-down evidence"
         result.pop("native_data", None)
         return result

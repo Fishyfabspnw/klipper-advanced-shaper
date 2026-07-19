@@ -460,7 +460,8 @@ class ArtifactWriter:
             "attenuation_ci95_high", "reference_cross_axis_energy",
             "candidate_cross_axis_energy", "reference_cross_axis_energy_samples",
             "candidate_cross_axis_energy_samples", "cross_axis_regression", "qc_passed", "passed",
-            "capture_design", "pair_count", "pair_ids",
+            "capture_design", "pair_count", "pair_ids", "paired_window_fairness",
+            "measured_spectral_non_regression",
         ]]
         for axis, values in _validation_axes(report).items():
             if not isinstance(values, Mapping):
@@ -499,6 +500,13 @@ class ArtifactWriter:
                 values.get("passed", ""),
                 values.get("capture_design", ""), values.get("pair_count", ""),
                 "|".join(str(item) for item in values.get("pair_ids", [])),
+                json.dumps(
+                    values.get("paired_window_fairness"), separators=(",", ":")
+                ),
+                json.dumps(
+                    values.get("measured_spectral_non_regression"),
+                    separators=(",", ":"),
+                ),
             ])
         return rows
 
@@ -600,6 +608,11 @@ class ArtifactWriter:
         plots[1].grid(True, axis="y")
 
         normalized_validation = _normalized_validation_plot_data(report)
+        protocol = report.get("validation_protocol", {})
+        transient_validation = (
+            isinstance(protocol, Mapping)
+            and protocol.get("promotion_gate") == "finite_reversal_ringdown_v1"
+        )
         positions = np.arange(len(normalized_validation) or 1)
         if normalized_validation:
             candidate_means = [item["candidate_mean"] for item in normalized_validation]
@@ -696,8 +709,16 @@ class ArtifactWriter:
                     },
                 )
             plots[2].set(
-                title=f"Held-out paired validation · {overall} · lower is better",
-                ylabel="Normalized resonant-band energy\n(axis reference mean = 1.0; display only)",
+                title=(
+                    "Held-out paired ring-down validation"
+                    if transient_validation
+                    else "Held-out paired validation"
+                ) + f" · {overall} · lower is better",
+                ylabel=(
+                    "Normalized post-command modal-band energy\n"
+                    if transient_validation
+                    else "Normalized resonant-band energy\n"
+                ) + "(axis reference mean = 1.0; display only)",
             )
             plots[2].legend(
                 frameon=False, fontsize=7, ncol=1, loc="center left",
@@ -710,7 +731,11 @@ class ArtifactWriter:
                 transform=plots[2].transAxes, color=SLATE,
             )
             plots[2].set(
-                title="Held-out paired validation · PENDING",
+                title=(
+                    "Held-out paired ring-down validation"
+                    if transient_validation
+                    else "Held-out paired validation"
+                ) + " · PENDING",
                 ylabel="Normalized resonant-band energy",
             )
         plots[2].grid(True, axis="y")
@@ -1087,6 +1112,9 @@ class ArtifactWriter:
         cards = []
         protocol = report.get("validation_protocol", {})
         protocol = protocol if isinstance(protocol, Mapping) else {}
+        transient_validation = (
+            protocol.get("promotion_gate") == "finite_reversal_ringdown_v1"
+        )
         if protocol:
             mode = str(protocol.get("mode", ""))
             if mode.startswith("fast_lower_confidence"):
@@ -1098,11 +1126,17 @@ class ArtifactWriter:
             motion_seconds = _finite(protocol.get("estimated_motion_seconds_per_axis"))
             motion_minutes = motion_seconds / 60.0 if motion_seconds is not None else None
             if mode.startswith("fast_lower_confidence"):
-                repeat_summary = (
-                    f'{_escape(protocol.get("training_repeats", "-"))} train + '
-                    f'{_escape(protocol.get("reference_repeats", "-"))} reference + '
-                    f'{_escape(protocol.get("candidate_repeats", "-"))} candidate'
-                )
+                if transient_validation:
+                    repeat_summary = (
+                        f'{_escape(protocol.get("training_repeats", "-"))} training sweep + '
+                        f'{_escape(protocol.get("pair_count_per_axis", "-"))} A/B transient pairs'
+                    )
+                else:
+                    repeat_summary = (
+                        f'{_escape(protocol.get("training_repeats", "-"))} train + '
+                        f'{_escape(protocol.get("reference_repeats", "-"))} reference + '
+                        f'{_escape(protocol.get("candidate_repeats", "-"))} candidate'
+                    )
             else:
                 repeat_summary = (
                     f'{_escape(protocol.get("repeats_per_group", "-"))} repeats/group'
@@ -1114,7 +1148,10 @@ class ArtifactWriter:
                 f"Validation protocol: <strong>{_escape(protocol_label)}</strong>; "
                 "the motion estimate excludes host analysis and artifact time."
             )
-            if protocol.get("capture_design") == "paired_interleaved_ab":
+            if protocol.get("capture_design") in {
+                "paired_interleaved_ab",
+                "paired_interleaved_ab_finite_reversal_ringdown",
+            }:
                 findings.append(
                     "Held-out validation used readback-verified interleaved "
                     "reference/candidate pairs to reduce time-order drift bias."
@@ -1204,6 +1241,31 @@ class ArtifactWriter:
         cards_body = "".join(cards)
         audit_body = "".join(audit_items) or "<div><dt>Audit data</dt><dd>Not available</dd></div>"
         native_preview = report.get("native_command_preview")
+        validation_heading = (
+            "Before / after held-out ring-down validation"
+            if transient_validation
+            else "Before / after held-out validation"
+        )
+        reference_energy_heading = (
+            "Reference ring-down energy (acceleration²)"
+            if transient_validation
+            else "Reference energy (acceleration²)"
+        )
+        candidate_energy_heading = (
+            "Candidate ring-down energy (acceleration²)"
+            if transient_validation
+            else "Shaped energy (acceleration²)"
+        )
+        attenuation_definition = (
+            "paired, interleaved post-command ring-down modal-band energy"
+            if transient_validation
+            else "paired, interleaved held-out reference and candidate resonant-band energy"
+        )
+        interval_definition = (
+            "paired ring-down attenuation"
+            if transient_validation
+            else "resonance attenuation"
+        )
         next_action = (
             "This attempt is retained for diagnosis only. Correct the failing gate or data-quality issue, then run a new matched calibration."
             if tone == "rejected" else
@@ -1223,10 +1285,10 @@ class ArtifactWriter:
 <section aria-labelledby="findings"><h2 id="findings">Technical summary</h2><ol class="findings">{findings_body}</ol></section>
 <section aria-labelledby="axis"><h2 id="axis">Selection and modal evidence</h2><div class="axis-grid">{axis_body}</div></section>
 <section aria-labelledby="spectrum"><h2 id="spectrum">Input shaper spectrum</h2><p>Klipper-compatible frequency view of the normalized spectral response and evaluated allowlisted candidates. Native component values are unitless normalized or arbitrary response units, not acceleration²/Hz. <a href="{_escape(shaper_svg_name)}">Open the scalable SVG</a>.</p><div class="figure"><img src="{_escape(shaper_png_name)}" alt="Input shaper frequency profile with normalized spectral response traces, detected modal peaks, and allowlisted candidate metrics"></div></section>
-<section aria-labelledby="validation"><h2 id="validation">Before / after held-out validation</h2><div class="table-wrap"><table><thead><tr><th>Axis</th><th>Configured reference</th><th>Selected candidate</th><th>Reference energy (acceleration²)</th><th>Shaped energy (acceleration²)</th><th>Attenuation 95% CI</th><th>Cross-axis change</th><th>Gate</th></tr></thead><tbody>{validation_body}</tbody></table></div></section>
+<section aria-labelledby="validation"><h2 id="validation">{validation_heading}</h2><div class="table-wrap"><table><thead><tr><th>Axis</th><th>Configured reference</th><th>Selected candidate</th><th>{reference_energy_heading}</th><th>{candidate_energy_heading}</th><th>Attenuation 95% CI</th><th>Cross-axis change</th><th>Gate</th></tr></thead><tbody>{validation_body}</tbody></table></div></section>
 <section aria-labelledby="plots"><h2 id="plots">PSD, candidates, and validation plots</h2><div class="figure"><img src="{_escape(png_name)}" alt="Three technical plots showing modal spectrum, theoretical candidate acceleration estimates, and axis-normalized held-out paired validation observations with confidence intervals and gates"></div></section>
 <section aria-labelledby="candidates"><h2 id="candidates">Candidate and Pareto comparison</h2><div class="table-wrap"><table><thead><tr><th>Candidate</th><th>Hz</th><th>Max accel mm/s²</th><th>Residual</th><th>Smoothing</th><th>Repeatability</th><th>Cross-axis</th><th>Sensitivity</th></tr></thead><tbody>{candidate_body}</tbody></table></div></section>
-<section aria-labelledby="method"><h2 id="method">Definitions, method, and uncertainty</h2><div class="method"><article class="panel"><h3>How to read this report</h3><p><strong>Max accel</strong> is Klipper's smoothing-derived theoretical estimate at the captured square-corner velocity; it is not a mechanical safety rating. <strong>Attenuation</strong> compares paired, interleaved held-out reference and candidate resonant-band energy. The lower bound of its 95% paired-bootstrap confidence interval must reach 10%. <strong>Cross-axis change</strong> must not regress by more than 5%.</p><p>The validation chart divides each axis by its own reference mean for display only; individual dots remain paired observations and the raw acceleration-squared energies remain in JSON and CSV. Its interval validates resonance attenuation, not a physical or print-safe acceleration.</p><p>Adaptive-stock candidate scores use candidate-specific response-weighted predictions for training cross-axis PSD; generalized MZV uses the conservative 95th percentile over measured damping uncertainty. These predictions affect ranking but never replace the measured held-out cross-axis gate. Pareto candidates are non-dominated trade-offs; the selected profile chooses among them.</p></article><article class="panel"><h3>Audit metadata</h3><dl class="audit">{audit_body}</dl></article></div></section>
+<section aria-labelledby="method"><h2 id="method">Definitions, method, and uncertainty</h2><div class="method"><article class="panel"><h3>How to read this report</h3><p><strong>Max accel</strong> is Klipper's smoothing-derived theoretical estimate at the captured square-corner velocity; it is not a mechanical safety rating. <strong>Attenuation</strong> compares {attenuation_definition}. The lower bound of its 95% paired-bootstrap confidence interval must reach 10%. <strong>Cross-axis change</strong> must not regress by more than 5%.</p><p>The validation chart divides each axis by its own reference mean for display only; individual dots remain paired observations and the raw acceleration-squared energies remain in JSON and CSV. Its interval validates {interval_definition}, not a physical or print-safe acceleration. Finite-ringdown promotion additionally requires matched A/B sample rates and durations plus measured total-band and meaningful 5-Hz-band non-regression on commanded and cross axes; exact details and confidence bounds are retained in JSON and CSV.</p><p>Adaptive-stock candidate scores use candidate-specific response-weighted predictions for training cross-axis PSD; generalized MZV uses the conservative 95th percentile over measured damping uncertainty. These predictions affect ranking but never replace the measured held-out cross-axis gate. Pareto candidates are non-dominated trade-offs; the selected profile chooses among them.</p></article><article class="panel"><h3>Audit metadata</h3><dl class="audit">{audit_body}</dl></article></div></section>
 <section aria-labelledby="limits"><h2 id="limits">Limitations</h2><div class="panel"><p>Results apply only to the tested sensor mount, toolhead mass, belt state, temperature, fan state, excitation, square-corner velocity, and sampling quality. A smoothing-derived acceleration estimate does not prove stepper torque, frame, hotend flow, or print-quality capability.</p><details><summary>Show exact machine-readable report</summary><pre>{payload}</pre></details></div></section>
 <section aria-labelledby="action"><h2 id="action">Next action</h2><div class="panel next"><p>{_escape(next_action)}</p>{command_block}</div></section>
 <footer>Generated locally and designed for offline review. No external assets, scripts, fonts, or network requests are used. Raw captures remain private and are not exported to CSV.</footer>

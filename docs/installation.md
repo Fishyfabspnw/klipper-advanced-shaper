@@ -15,6 +15,11 @@ You need:
 - a connected accelerometer that already works with Klipper's native
   `ACCELEROMETER_QUERY` and `SHAPER_CALIBRATE` workflow.
 
+Ordinary native profiles use that Klipper-supported sensor normally. The
+experimental finite-reversal promotion path currently has a strict full-scale
+proof allowlist for ADXL345, LIS2DW, and LIS3DH identities. Any other sensor
+abstains before transient motion rather than assuming a clipping limit.
+
 Complete Klipper's official
 [measuring resonances](https://www.klipper3d.org/Measuring_Resonances.html)
 setup first. This plugin uses Klipper's configured resonance motion and sensor;
@@ -168,12 +173,12 @@ The visible `ADV_SHAPER_UI_CALIBRATE` macro accepts these same parameters:
 | --- | --- |
 | `AXIS` | `X`, `Y`, or `ALL`; default `ALL`. |
 | `PROFILE` | `quality`, `balanced`, `performance`, `experimental_mzv`, or `adaptive_stock`; default `balanced`. The last two require the config opt-in and validation. |
-| `REPEATS` | Integer `1..20`; default `3`. Experimental profiles require at least three unless fast validation uses `2` for each held-out group and one training sweep. |
-| `VALIDATE` | `0` or `1`; default `1`. Mandatory for experimental profiles. |
+| `REPEATS` | Integer `1..20`; default `3`. Unshaped `TEST_RESONANCES` training sweeps; experimental full validation requires at least three, while fast validation uses one training sweep and two transient A/B pairs. |
+| `VALIDATE` | `0` or `1`; default `1`. Enables finite-reversal raw ring-down validation and is mandatory for experimental profiles. |
 | `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal `20..350` mm/s^2/Hz. It is a free numeric value, not a preset list. |
 | `HZ_PER_SEC` | `CONFIG` or any unsigned decimal `0.1..2` Hz/s; default `CONFIG`. |
 | `SCV` | `CONFIG` or any unsigned decimal `0.1..50` mm/s; default `CONFIG`. A numeric value is temporary, read back before capture, recorded, and restored to the exact snapshot value. |
-| `FAST_VALIDATION` | `0` or `1`; default `0`. `1` is experimental-only, requires `REPEATS=2 VALIDATE=1 HZ_PER_SEC=2`, and runs one training plus two reference and two candidate sweeps. |
+| `FAST_VALIDATION` | `0` or `1`; default `0`. `1` is experimental-only, requires `REPEATS=2 VALIDATE=1 HZ_PER_SEC=2`, and runs one training sweep plus two interleaved reference/candidate transient pairs. |
 | `PEAK_LOCK` | `0` or `1`; default `0`. Experimental-only; locks generalized MZV to the strongest measured axis peak. |
 
 Mainsail's standard macro UI cannot show a different tooltip for each input.
@@ -219,10 +224,9 @@ or the explicitly lower-confidence fast protocol:
 ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=175 HZ_PER_SEC=2 SCV=15 FAST_VALIDATION=1
 ```
 
-For a configured 5–135 Hz range, fast validation commands five sweeps, or about
-5.4 minutes of resonance motion per axis at 2 Hz/s. Setup, probe movement,
-readback, analysis, rendering, and file I/O add time, so this is not a guarantee
-that the full workflow finishes within seven minutes.
+Fast validation performs one unshaped training resonance sweep and four short
+transient captures per axis. Its duration depends on printer geometry, queued
+motion, sensor, and host timing; it intentionally makes no wall-time promise.
 
 ## Find the results
 
