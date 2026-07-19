@@ -19,7 +19,7 @@ Before starting:
 Run the visible Mainsail macro or enter the same command in the console:
 
 ```text
-ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=balanced REPEATS=3 VALIDATE=1 ACCEL_PER_HZ=CONFIG HZ_PER_SEC=CONFIG FAST_VALIDATION=0 PEAK_LOCK=0
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=balanced REPEATS=3 VALIDATE=1 ACCEL_PER_HZ=CONFIG HZ_PER_SEC=CONFIG SCV=CONFIG FAST_VALIDATION=0 PEAK_LOCK=0
 ```
 
 Here are the available parameters:
@@ -32,6 +32,7 @@ Here are the available parameters:
 | `VALIDATE` | `1` | `1` performs held-out reference and candidate captures; `0` skips them. Experimental profiles always require `1`. |
 | `ACCEL_PER_HZ` | `CONFIG` | Free numeric excitation intensity: `CONFIG` or any unsigned decimal from `20` through `350` mm/s²/Hz. This is not a preset list. Higher is not automatically better and must pass the printer-specific motion-budget check. |
 | `HZ_PER_SEC` | `CONFIG` | Sweep rate: `CONFIG` or any unsigned decimal from `0.1` through `2` Hz/s. A faster rate shortens motion time but can reduce measurement confidence. |
+| `SCV` | `CONFIG` | Temporary square-corner velocity: `CONFIG` or any unsigned decimal from `0.1` through `50` mm/s. A numeric value is applied after the exact snapshot, verified by Klipper readback, used in smoothing calculations, reported, and restored exactly. |
 | `FAST_VALIDATION` | `0` | `1` selects the lower-confidence experimental protocol and requires exactly `REPEATS=2 VALIDATE=1 HZ_PER_SEC=2`. It runs one training plus two reference and two candidate sweeps; it does not remove QC, confidence, readback, cross-axis, or rollback gates. |
 | `PEAK_LOCK` | `0` | Experimental-only. `1` fixes generalized-MZV frequency to the strongest measured mode on that axis while still optimizing allowlisted pulse count and spacing. |
 
@@ -60,7 +61,7 @@ explicit `adaptive_stock` profile.
 ## Fast experimental example
 
 ```text
-ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=350 HZ_PER_SEC=2 FAST_VALIDATION=1 PEAK_LOCK=1
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=175 HZ_PER_SEC=2 SCV=15 FAST_VALIDATION=1 PEAK_LOCK=1
 ```
 
 For a configured 5–135 Hz range, this commands approximately 5.4 minutes of

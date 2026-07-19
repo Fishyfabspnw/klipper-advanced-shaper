@@ -78,6 +78,9 @@ class FakeAdapter:
     def apply_temporary(self, selections):
         self.calls.append(("apply", tuple(selections)))
 
+    def set_test_square_corner_velocity(self, value):
+        self.calls.append(("set_scv", float(value)))
+
     def restore(self, snapshot):
         self.calls.append(("restore", snapshot))
         if self.fail_restore:
@@ -219,6 +222,27 @@ def test_bounded_numeric_350_propagates_to_both_axes():
     assert [(call[1], call[4]) for call in captures] == [("X", 350.0), ("Y", 350.0)]
     assert not [call for call in adapter.calls if call[0] == "stage"]
     assert adapter.calls[-1] == ("restore", SNAPSHOT)
+
+
+def test_explicit_scv_is_applied_after_snapshot_and_restored_exactly():
+    seen = []
+
+    def scv_analyzer(**kwargs):
+        seen.append(kwargs["snapshot"].square_corner_velocity)
+        return analyzer(**kwargs)
+
+    adapter = FakeAdapter()
+    plugin = AdvancedInputShaper(adapter=adapter, analyzer=scv_analyzer)
+
+    result = plugin.calibrate(
+        ("X",), repeats=1, validate=False, square_corner_velocity="15"
+    )
+
+    assert adapter.calls.index(("snapshot",)) < adapter.calls.index(("set_scv", 15.0))
+    assert adapter.calls[-1] == ("restore", SNAPSHOT)
+    assert seen == [15.0]
+    assert result.report["validation_protocol"]["square_corner_velocity"] == 15.0
+    assert result.report["validation_protocol"]["square_corner_velocity_source"] == "command"
 
 
 def test_dynamic_excitation_rejection_happens_before_snapshot_or_capture():
@@ -366,11 +390,13 @@ def test_rejected_validation_is_written_only_after_rollback_with_full_diagnostic
             "lower_confidence": True,
             "repeats_per_group": 2,
             "validation_enabled": True,
-            "full_sweeps_per_axis": 6,
-            "motion_time_excludes_host_analysis_and_artifact_time": True,
-            "estimated_motion_seconds_per_axis": 570.0,
-            "hz_per_sec": 1.0,
-        },
+                "full_sweeps_per_axis": 6,
+                "motion_time_excludes_host_analysis_and_artifact_time": True,
+                "square_corner_velocity_source": "printer_snapshot",
+                "estimated_motion_seconds_per_axis": 570.0,
+                "hz_per_sec": 1.0,
+                "square_corner_velocity": 5.0,
+            },
     }
 
 

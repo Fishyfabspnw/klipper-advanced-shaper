@@ -107,7 +107,7 @@ does not load Klippy, read accelerometer data, or issue G-code.
 ## Commands
 
 ```text
-ADV_SHAPER_CALIBRATE AXIS=X|Y|ALL PROFILE=quality|balanced|performance|experimental_mzv|adaptive_stock REPEATS=3 VALIDATE=1 ACCEL_PER_HZ=CONFIG|20..350 HZ_PER_SEC=CONFIG|0.1..2 FAST_VALIDATION=0|1 PEAK_LOCK=0|1
+ADV_SHAPER_CALIBRATE AXIS=X|Y|ALL PROFILE=quality|balanced|performance|experimental_mzv|adaptive_stock REPEATS=3 VALIDATE=1 ACCEL_PER_HZ=CONFIG|20..350 HZ_PER_SEC=CONFIG|0.1..2 SCV=CONFIG|0.1..50 FAST_VALIDATION=0|1 PEAK_LOCK=0|1
 ADV_SHAPER_STATUS
 ADV_SHAPER_CANCEL
 ADV_SHAPER_APPLY RESULT=<id>
@@ -127,6 +127,7 @@ calibration parameters:
 | `VALIDATE` | `0` or `1` | `1` | Runs independent reference and candidate sweeps when `1`. It is mandatory for both experimental profiles. A `0` run is not physical performance evidence. |
 | `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal from `20` through `350` | `CONFIG` | Free numeric excitation control in mm/s^2/Hz—not presets. `CONFIG` inherits `[resonance_tester]`. The resolved value must pass the dynamic motion-budget check. |
 | `HZ_PER_SEC` | `CONFIG` or any unsigned decimal from `0.1` through `2` | `CONFIG` | Sweep rate in Hz/s. It changes commanded sweep time, not excitation intensity. |
+| `SCV` | `CONFIG` or any unsigned decimal from `0.1` through `50` | `CONFIG` | Temporary square-corner velocity in mm/s used by smoothing calculations. It is applied only after the exact printer snapshot, verified by readback, recorded in the report, and restored exactly. |
 | `FAST_VALIDATION` | `0` or `1` | `0` | Lower-confidence mode for the two experimental profiles only. `1` requires exactly `REPEATS=2`, `VALIDATE=1`, and explicit `HZ_PER_SEC=2`; it runs one training, two reference, and two candidate sweeps. |
 | `PEAK_LOCK` | `0` or `1` | `0` | Experimental profiles only. `1` fixes generalized-MZV frequency to the strongest measured PSD mode for that axis; it does not weaken any validation gate. |
 
@@ -152,7 +153,7 @@ Klippy's low-level `ADV_SHAPER_STATUS`, `ADV_SHAPER_CANCEL`,
 The same free numeric control is available from the console, for example:
 
 ```text
-ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=350 HZ_PER_SEC=2 FAST_VALIDATION=1
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=175 HZ_PER_SEC=2 SCV=15 FAST_VALIDATION=1
 ```
 
 `ACCEL_PER_HZ` accepts `CONFIG` or an unsigned decimal from 20 through 350
@@ -229,7 +230,7 @@ ADV_SHAPER_CALIBRATE AXIS=X PROFILE=experimental_mzv REPEATS=2 VALIDATE=1 ACCEL_
 The same bounded protocol can run the cross-family stock-compatible search:
 
 ```text
-ADV_SHAPER_CALIBRATE AXIS=ALL PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=350 HZ_PER_SEC=2 FAST_VALIDATION=1 PEAK_LOCK=1
+ADV_SHAPER_CALIBRATE AXIS=ALL PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=175 HZ_PER_SEC=2 SCV=15 FAST_VALIDATION=1 PEAK_LOCK=1
 ```
 
 This performs one training, two held-out reference, and two candidate sweeps.

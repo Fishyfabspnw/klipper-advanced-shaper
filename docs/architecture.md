@@ -64,6 +64,12 @@ defaults continue to come from the running Klipper configuration. The same
 resolved value is used for training, held-out reference, and candidate sweeps,
 and the native recipe records the effective value in each capture.
 
+An explicit `SCV` override is separate from the resonance command recipe. The
+controller snapshots the original square-corner velocity first, sends a bounded
+stock `SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=...` command, verifies exact
+toolhead-status readback, uses that value for fitting, and restores and verifies
+the original SCV on every exit path.
+
 Sweep rate is an orthogonal strict override. `HZ_PER_SEC=CONFIG` inherits the
 active `[resonance_tester]` value; explicit unsigned decimals are bounded to
 0.1..2 Hz/s. The capture preflight resolves and validates the effective rate,

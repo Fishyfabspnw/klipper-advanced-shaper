@@ -482,6 +482,7 @@ def test_snapshot_falls_back_to_v013_axis_params_and_restore_velocity():
     adapter.restore(snapshot)
     assert config.printer.gcode.commands[-1].startswith("SET_VELOCITY_LIMIT VELOCITY=900")
     assert "ACCEL=70000" in config.printer.gcode.commands[-1]
+    assert "SQUARE_CORNER_VELOCITY=7" in config.printer.gcode.commands[-1]
 
 
 def test_printer_legacy_shaper_defs_abstain_from_generalized_mzv():
@@ -642,8 +643,14 @@ def test_parameterized_snapshot_and_exact_restore_use_installed_capability():
                         shaping[suffix]["shaper_freq"] = values["SHAPER_FREQ_" + axis]
                         shaping[suffix]["damping_ratio"] = values["DAMPING_RATIO_" + axis]
             elif command.startswith("SET_VELOCITY_LIMIT"):
-                velocity["max_velocity"] = float(values["VELOCITY"])
-                velocity["max_accel"] = float(values["ACCEL"])
+                if "VELOCITY" in values:
+                    velocity["max_velocity"] = float(values["VELOCITY"])
+                if "ACCEL" in values:
+                    velocity["max_accel"] = float(values["ACCEL"])
+                if "SQUARE_CORNER_VELOCITY" in values:
+                    velocity["square_corner_velocity"] = float(
+                        values["SQUARE_CORNER_VELOCITY"]
+                    )
                 if "MINIMUM_CRUISE_RATIO" in values:
                     velocity["minimum_cruise_ratio"] = float(
                         values["MINIMUM_CRUISE_RATIO"]
@@ -694,6 +701,9 @@ def test_parameterized_snapshot_and_exact_restore_use_installed_capability():
     snapshot = adapter.snapshot()
     assert snapshot.shaper_type_x == "mzv(n=4,tau=1.200000)"
 
+    adapter.set_test_square_corner_velocity(15.0)
+    assert velocity["square_corner_velocity"] == 15.0
+
     shaping["x"].update(
         {"shaper_type": "mzv", "shaper_freq": "60.000", "damping_ratio": "0.100000"}
     )
@@ -704,6 +714,7 @@ def test_parameterized_snapshot_and_exact_restore_use_installed_capability():
     assert float(shaping["x"]["damping_ratio"]) == snapshot.damping_ratio_x
     assert velocity["max_velocity"] == snapshot.max_velocity
     assert velocity["max_accel"] == snapshot.max_accel
+    assert velocity["square_corner_velocity"] == snapshot.square_corner_velocity
 
 
 def test_restore_attempts_velocity_when_shaper_restore_fails():
@@ -741,9 +752,10 @@ def test_restore_attempts_velocity_when_shaper_restore_fails():
             "shaper_type_y": "ei",
             "shaper_freq_y": 48.0,
             "damping_ratio_y": 0.1,
-            "max_velocity": 900.0,
-            "max_accel": 70000.0,
-            "minimum_cruise_ratio": 0.5,
+                "max_velocity": 900.0,
+                "max_accel": 70000.0,
+                "square_corner_velocity": 7.0,
+                "minimum_cruise_ratio": 0.5,
         },
     )()
     with pytest.raises(RuntimeError, match="shaper restore failed"):

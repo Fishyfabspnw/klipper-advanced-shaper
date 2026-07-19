@@ -63,6 +63,7 @@ def test_shaketune_style_docs_index_and_macro_reference_are_packaged():
         "`VALIDATE`",
         "`ACCEL_PER_HZ`",
         "`HZ_PER_SEC`",
+        "`SCV`",
         "`FAST_VALIDATION`",
         "`PEAK_LOCK`",
     ):
@@ -118,6 +119,7 @@ def test_readme_has_complete_calibration_parameter_reference():
         "`VALIDATE`",
         "`ACCEL_PER_HZ`",
         "`HZ_PER_SEC`",
+        "`SCV`",
         "`FAST_VALIDATION`",
         "`PEAK_LOCK`",
     ):

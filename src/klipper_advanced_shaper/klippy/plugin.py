@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .adapter import (
@@ -14,7 +14,11 @@ from .adapter import (
     ShaperSelection,
     selection_from_mapping,
 )
-from .excitation import parse_accel_per_hz, parse_hz_per_sec
+from .excitation import (
+    parse_accel_per_hz,
+    parse_hz_per_sec,
+    parse_square_corner_velocity,
+)
 from .state import CalibrationCancelled, CalibrationState, StateMachine
 
 SUPPORTED_PROFILES = {
@@ -148,6 +152,7 @@ class AdvancedInputShaper:
         validate: bool = True,
         accel_per_hz: Any = None,
         hz_per_sec: Any = None,
+        square_corner_velocity: Any = None,
         fast_validation: Any = False,
         peak_lock: Any = False,
     ) -> CalibrationResult:
@@ -161,6 +166,7 @@ class AdvancedInputShaper:
             raise ValueError("repeats must be between 1 and 20")
         selected_accel_per_hz = parse_accel_per_hz(accel_per_hz)
         selected_hz_per_sec = parse_hz_per_sec(hz_per_sec)
+        selected_scv = parse_square_corner_velocity(square_corner_velocity)
         fast_validation_enabled = _parse_fast_validation(fast_validation)
         peak_lock_enabled = _parse_peak_lock(peak_lock)
         experimental_mode = profile in {"experimental_mzv", "adaptive_stock"}
@@ -207,6 +213,9 @@ class AdvancedInputShaper:
                 training_repeats + reference_repeats + candidate_repeats
             ),
             "motion_time_excludes_host_analysis_and_artifact_time": True,
+            "square_corner_velocity_source": (
+                "command" if selected_scv is not None else "printer_snapshot"
+            ),
         }
         if fast_validation_enabled:
             validation_protocol.update(
@@ -269,6 +278,21 @@ class AdvancedInputShaper:
                 executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             self.machine.checkpoint()
             snapshot = self.adapter.snapshot()
+            analysis_snapshot = snapshot
+            if selected_scv is not None:
+                scv_setter = getattr(
+                    self.adapter, "set_test_square_corner_velocity", None
+                )
+                if scv_setter is None:
+                    raise RuntimeError("adapter cannot set and verify test SCV")
+                scv_setter(selected_scv)
+                analysis_snapshot = replace(
+                    snapshot, square_corner_velocity=selected_scv
+                )
+            validation_protocol["square_corner_velocity"] = float(
+                analysis_snapshot.square_corner_velocity
+            )
+            self.current_validation_protocol = dict(validation_protocol)
             snapshot_selections = tuple(
                 ShaperSelection(
                     getattr(snapshot, "shaper_type_" + axis.lower()),
@@ -305,7 +329,7 @@ class AdvancedInputShaper:
                 captures=captures,
                 axes=normalized_axes,
                 profile=profile,
-                snapshot=snapshot,
+                snapshot=analysis_snapshot,
                 experimental_mode=experimental_mode,
                 executor_pulse_limit=executor_pulse_limit,
                 peak_lock=peak_lock_enabled,
@@ -396,7 +420,7 @@ class AdvancedInputShaper:
                     validation_captures=validation,
                     axes=normalized_axes,
                     profile=profile,
-                    snapshot=snapshot,
+                    snapshot=analysis_snapshot,
                     prior_report=report,
                     experimental_mode=experimental_mode,
                     executor_pulse_limit=executor_pulse_limit,
@@ -639,6 +663,7 @@ class AdvancedInputShaper:
                 validate=bool(gcmd.get_int("VALIDATE", 1, minval=0, maxval=1)),
                 accel_per_hz=gcmd.get("ACCEL_PER_HZ", None),
                 hz_per_sec=gcmd.get("HZ_PER_SEC", None),
+                square_corner_velocity=gcmd.get("SCV", None),
                 fast_validation=gcmd.get_int(
                     "FAST_VALIDATION", 0, minval=0, maxval=1
                 ),

@@ -49,3 +49,6 @@ The validation protocol block labels full-confidence versus lower-confidence
 fast validation, repeat and sweep counts, effective Hz/s, and estimated physical
 motion time per axis. This timing deliberately excludes host analysis, report
 rendering, and artifact I/O.
+The same block records the effective square-corner velocity and whether it came
+from the printer snapshot or an explicit temporary `SCV` parameter. That value
+is smoothing-model context, not a validated acceleration limit.

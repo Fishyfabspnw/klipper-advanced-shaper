@@ -10,6 +10,8 @@ MIN_ACCEL_PER_HZ = 20.0
 MAX_ACCEL_PER_HZ = 350.0
 MIN_HZ_PER_SEC = 0.1
 MAX_HZ_PER_SEC = 2.0
+MIN_SCV = 0.1
+MAX_SCV = 50.0
 MOTION_LIMIT_FRACTION = 0.80
 _STRICT_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
 
@@ -46,6 +48,23 @@ def parse_hz_per_sec(value: Any) -> Optional[float]:
     parsed = float(text)
     if not math.isfinite(parsed) or not MIN_HZ_PER_SEC <= parsed <= MAX_HZ_PER_SEC:
         raise ValueError("HZ_PER_SEC must be between 0.1 and 2 Hz/s")
+    return parsed
+
+
+def parse_square_corner_velocity(value: Any) -> Optional[float]:
+    """Parse CONFIG or a strictly bounded square-corner velocity."""
+    if value is None:
+        return None
+    text = str(value)
+    if text.upper() == "CONFIG":
+        return None
+    if not _STRICT_DECIMAL.fullmatch(text):
+        raise ValueError(
+            "SCV must be CONFIG or an unsigned decimal between 0.1 and 50 mm/s"
+        )
+    parsed = float(text)
+    if not math.isfinite(parsed) or not MIN_SCV <= parsed <= MAX_SCV:
+        raise ValueError("SCV must be between 0.1 and 50 mm/s")
     return parsed
 
 

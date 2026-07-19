@@ -7,7 +7,11 @@ from klipper_advanced_shaper.klippy.excitation import (
     check_motion_budget,
     check_sweep_rate,
 )
-from klipper_advanced_shaper.klippy.plugin import parse_accel_per_hz, parse_hz_per_sec
+from klipper_advanced_shaper.klippy.plugin import (
+    parse_accel_per_hz,
+    parse_hz_per_sec,
+    parse_square_corner_velocity,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -79,6 +83,20 @@ def test_hz_per_sec_parser_rejects_out_of_range_or_non_decimal_values(value):
         parse_hz_per_sec(value)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, None), ("CONFIG", None), ("0.1", 0.1), ("15", 15.0), (50, 50.0)],
+)
+def test_scv_parser_accepts_config_or_bounded_decimals(value, expected):
+    assert parse_square_corner_velocity(value) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "0.099", "50.001", "+15", "015", "1e1"])
+def test_scv_parser_rejects_unsafe_or_noncanonical_values(value):
+    with pytest.raises(ValueError, match="SCV"):
+        parse_square_corner_velocity(value)
+
+
 def test_effective_configured_sweep_rate_is_checked_fail_closed():
     assert check_sweep_rate(2.0) == 2.0
     with pytest.raises(RuntimeError, match="effective .* hz_per_sec"):
@@ -143,6 +161,7 @@ def test_direct_numeric_calibration_is_the_only_mainsail_visible_macro():
     ]
     assert 'params.ACCEL_PER_HZ|default("CONFIG")' in macros
     assert 'params.HZ_PER_SEC|default("CONFIG")' in macros
+    assert 'params.SCV|default("CONFIG")' in macros
     assert "params.FAST_VALIDATION|default(0)" in macros
     assert "params.PEAK_LOCK|default(0)" in macros
     assert "PEAK_LOCK={peak_lock}" in macros
@@ -155,6 +174,7 @@ def test_direct_numeric_calibration_is_the_only_mainsail_visible_macro():
         "VALIDATE enables held-out comparison",
         "ACCEL_PER_HZ sets excitation intensity",
         "HZ_PER_SEC sets sweep speed",
+        "SCV sets temporary square-corner velocity",
         "FAST_VALIDATION=1 runs one training, two reference, and two candidate sweeps",
         "PEAK_LOCK=1 fixes generalized MZV frequency",
     ):

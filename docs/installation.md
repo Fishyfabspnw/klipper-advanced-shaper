@@ -167,6 +167,7 @@ The visible `ADV_SHAPER_UI_CALIBRATE` macro accepts these same parameters:
 | `VALIDATE` | `0` or `1`; default `1`. Mandatory for experimental profiles. |
 | `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal `20..350` mm/s^2/Hz. It is a free numeric value, not a preset list. |
 | `HZ_PER_SEC` | `CONFIG` or any unsigned decimal `0.1..2` Hz/s; default `CONFIG`. |
+| `SCV` | `CONFIG` or any unsigned decimal `0.1..50` mm/s; default `CONFIG`. A numeric value is temporary, read back before capture, recorded, and restored to the exact snapshot value. |
 | `FAST_VALIDATION` | `0` or `1`; default `0`. `1` is experimental-only, requires `REPEATS=2 VALIDATE=1 HZ_PER_SEC=2`, and runs one training plus two reference and two candidate sweeps. |
 | `PEAK_LOCK` | `0` or `1`; default `0`. Experimental-only; locks generalized MZV to the strongest measured axis peak. |
 
@@ -210,7 +211,7 @@ ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=3 VALIDATE=1 ACCEL
 or the explicitly lower-confidence fast protocol:
 
 ```text
-ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=350 HZ_PER_SEC=2 FAST_VALIDATION=1
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=175 HZ_PER_SEC=2 SCV=15 FAST_VALIDATION=1
 ```
 
 For a configured 5–135 Hz range, fast validation commands five sweeps, or about

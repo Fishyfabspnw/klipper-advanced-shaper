@@ -89,6 +89,7 @@ class PrinterAdapter(Protocol):
         hz_per_sec: Optional[float] = None,
     ) -> Any: ...
     def apply_temporary(self, selections: Sequence[ShaperSelection]) -> None: ...
+    def set_test_square_corner_velocity(self, value: float) -> None: ...
     def restore(self, snapshot: PrinterSnapshot) -> None: ...
     def stage(self, selections: Sequence[ShaperSelection]) -> None: ...
     def respond(self, message: str) -> None: ...
@@ -386,6 +387,22 @@ class KlipperPrinterAdapter:
             self.gcode.run_script_from_command(command)
         self.verify_applied(selections)
 
+    def set_test_square_corner_velocity(self, value: float) -> None:
+        target = float(value)
+        if not 0.1 <= target <= 50.0:
+            raise RuntimeError("test square-corner velocity is outside 0.1..50 mm/s")
+        self.gcode.run_script_from_command(
+            "SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=%.6f" % target
+        )
+        eventtime = self.printer.get_reactor().monotonic()
+        status = self.printer.lookup_object("toolhead").get_status(eventtime)
+        actual = status.get("square_corner_velocity")
+        if actual is None or abs(float(actual) - target) > 0.0000005:
+            raise RuntimeError(
+                "SCV readback mismatch: expected %.6f, got %s"
+                % (target, actual if actual is not None else "unavailable")
+            )
+
     def restore(self, snapshot: PrinterSnapshot) -> None:
         errors = []
         try:
@@ -407,9 +424,13 @@ class KlipperPrinterAdapter:
             )
         except BaseException as error:
             errors.append(error)
-        velocity = "SET_VELOCITY_LIMIT VELOCITY=%.6f ACCEL=%.6f" % (
+        velocity = (
+            "SET_VELOCITY_LIMIT VELOCITY=%.6f ACCEL=%.6f "
+            "SQUARE_CORNER_VELOCITY=%.6f"
+        ) % (
             snapshot.max_velocity,
             snapshot.max_accel,
+            snapshot.square_corner_velocity,
         )
         if snapshot.minimum_cruise_ratio is not None:
             velocity += " MINIMUM_CRUISE_RATIO=%.6f" % snapshot.minimum_cruise_ratio
@@ -432,6 +453,7 @@ class KlipperPrinterAdapter:
         expected = {
             "max_velocity": snapshot.max_velocity,
             "max_accel": snapshot.max_accel,
+            "square_corner_velocity": snapshot.square_corner_velocity,
         }
         if snapshot.minimum_cruise_ratio is not None:
             expected["minimum_cruise_ratio"] = snapshot.minimum_cruise_ratio
