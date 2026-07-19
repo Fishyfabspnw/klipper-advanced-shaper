@@ -30,27 +30,24 @@ generalized-MZV design space and a conservative acceleration envelope. It is
 not connected to `APPLY` or `STAGE`, and cannot change printer acceleration.
 See [experimental generalized MZV](docs/experimental-generalized-mzv.md).
 
-## Install
+## Quick install
 
-On the Klipper host, clone this repository somewhere outside the Klipper source
-tree, then run:
+Requirements: a working Klipper host, Python 3.9–3.11, Git, a configured
+`[resonance_tester]`, and a connected accelerometer supported by Klipper. Stop
+any print and leave the printer idle before installing or restarting Klipper.
+
+SSH into the Klipper host as the account that owns the Klipper installation,
+then run:
 
 ```sh
-chmod +x scripts/install.sh scripts/update.sh
+cd ~
+git clone --branch feature/initial-alpha \
+  https://github.com/Fishyfabspnw/klipper-advanced-shaper.git
+cd klipper-advanced-shaper
 ./scripts/install.sh
 ```
 
-The installer supports `KLIPPER_DIR` and `KLIPPER_VENV` when Klipper is not in
-the usual `~/klipper` and `~/klippy-env` locations. It installs the Python
-package into Klipper's virtual environment and a small loader into
-`klippy/extras`. A differing existing loader is preserved with a `.previous`
-suffix. The installer does not restart Klipper or edit printer configuration.
-After every package install or update, restart the actual Klipper host service
-while the printer is idle (commonly `sudo systemctl restart klipper`). Klipper's
-G-code `RESTART` command is not sufficient to load updated Python package code.
-
-Add this section to `printer.cfg`, review it, and restart the Klipper host
-service while idle:
+Add this section to `printer.cfg`:
 
 ```ini
 [advanced_input_shaper]
@@ -60,11 +57,20 @@ service while idle:
 # minimum_max_accel_y: 5840   # Optional target-printer acceptance gate
 ```
 
-To update an unmodified checkout with a fast-forward-only pull:
+Restart the **host service** while the printer is idle:
 
 ```sh
-./scripts/update.sh
+sudo systemctl restart klipper
 ```
+
+Klipper's G-code `RESTART` command is not enough after installing Python code.
+Confirm that `ADV_SHAPER_STATUS` is recognized before attempting a calibration.
+
+The installer does not restart Klipper or edit `printer.cfg`. It installs the
+package into `~/klippy-env` and a small loader into `~/klipper/klippy/extras`.
+Custom Klipper locations, updating, uninstalling, verification, and
+troubleshooting are covered in the
+**[complete installation guide](docs/installation.md)**.
 
 Before calibration, the analysis interpreter boundary can be checked without
 connecting to the MCU or commanding any printer motion:
@@ -86,6 +92,14 @@ ADV_SHAPER_STATUS
 ADV_SHAPER_CANCEL
 ADV_SHAPER_APPLY RESULT=<id>
 ADV_SHAPER_STAGE RESULT=<id>
+```
+
+Run calibration only while the printer is idle, clear of obstructions, and
+homed on every requested axis. Start with one axis and the conservative default
+profile:
+
+```text
+ADV_SHAPER_CALIBRATE AXIS=X PROFILE=balanced REPEATS=3 VALIDATE=1
 ```
 
 `APPLY` is runtime-only. `STAGE` prepares accepted native input-shaper values;

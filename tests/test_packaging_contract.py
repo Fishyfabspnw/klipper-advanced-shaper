@@ -25,6 +25,21 @@ def test_klipper_loader_exposes_load_config():
     assert callable(namespace["load_config"])
 
 
+def test_installation_guide_covers_full_lifecycle():
+    guide = (ROOT / "docs" / "installation.md").read_text(encoding="utf-8")
+    for expected in (
+        "./scripts/install.sh",
+        "./scripts/update.sh",
+        "./scripts/uninstall.sh",
+        "ADV_SHAPER_STATUS",
+        "ACCELEROMETER_QUERY",
+        "sudo systemctl restart klipper",
+        "KLIPPER_DIR",
+        "KLIPPER_VENV",
+    ):
+        assert expected in guide
+
+
 def test_private_artifact_patterns_are_ignored():
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "*.stdata" in ignore
