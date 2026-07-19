@@ -249,6 +249,67 @@ def test_validation_plot_is_axis_normalized_display_only_with_exact_labels():
     assert report["validation"]["axes"]["X"]["reference_energy_samples"] == [10.0, 14.0]
 
 
+def test_extreme_validation_rejection_uses_bounded_badges_and_external_legend(
+    tmp_path, monkeypatch
+):
+    from matplotlib.axes import Axes
+
+    report = _complete_report("rejected")
+    report["validation"]["axes"]["X"].update({
+        "candidate_energy_samples": [51.0, 61.0],
+        "shaped_energy": 56.0,
+        "improvement_ci_95": [-5.1, -3.6],
+        "cross_axis_regression": 21.997,
+        "passed": False,
+    })
+    report["reference"].append({
+        "axis": "Y", "shaper_type": "mzv", "frequency_hz": 50.0,
+        "damping_ratio": 0.056,
+    })
+    report["selections"].append({
+        "axis": "Y", "shaper_type": "mzv(n=4,t=0.650000)",
+        "frequency_hz": 48.8, "damping_ratio": 0.097,
+    })
+    report["validation"]["axes"]["Y"] = {
+        "baseline_energy": 100.0,
+        "shaped_energy": 4.0,
+        "reference_energy_samples": [95.0, 105.0],
+        "candidate_energy_samples": [3.0, 5.0],
+        "improvement_ci_95": [0.93, 0.96],
+        "cross_axis_regression": -0.88,
+        "passed": True,
+    }
+
+    legend_calls = []
+    status_calls = []
+    original_legend = Axes.legend
+    original_text = Axes.text
+
+    def record_legend(self, *args, **kwargs):
+        if kwargs.get("bbox_to_anchor") == (1.01, 0.5):
+            legend_calls.append(kwargs.copy())
+        return original_legend(self, *args, **kwargs)
+
+    def record_text(self, x, y, value, *args, **kwargs):
+        if value in {"REJECT\ncross +2199.7%", "PASS\ncross -88.0%"}:
+            status_calls.append((x, y, kwargs.copy()))
+        return original_text(self, x, y, value, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "legend", record_legend)
+    monkeypatch.setattr(Axes, "text", record_text)
+
+    ArtifactWriter(tmp_path, keep_raw=False).write("extreme", report)
+
+    assert (tmp_path / "extreme" / "summary.png").stat().st_size > 100
+    assert len(legend_calls) == 1
+    assert legend_calls[0]["loc"] == "center left"
+    assert legend_calls[0]["ncol"] == 1
+    assert len(status_calls) == 2
+    assert all(y == 0.975 for _x, y, _kwargs in status_calls)
+    assert all(call[2]["transform"] is not None for call in status_calls)
+    assert all("bbox" in call[2] for call in status_calls)
+
+
 def test_rejected_report_leads_with_failure_and_cannot_imply_applicability(tmp_path):
     report = _complete_report("rejected")
     ArtifactWriter(tmp_path, keep_raw=False).write("rejected", report)

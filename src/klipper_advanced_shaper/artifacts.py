@@ -615,6 +615,7 @@ class ArtifactWriter:
             )
             labels = []
             plot_highest = 1.0
+            validation_statuses = []
             for position, item in zip(positions, normalized_validation):
                 reference = item["reference"]
                 candidate = item["candidate"]
@@ -663,10 +664,7 @@ class ArtifactWriter:
                 )
                 cross = item["cross_axis_regression"]
                 status = state + (f"\ncross {cross:+.1%}" if cross is not None else "")
-                plots[2].text(
-                    position, axis_highest + 0.07, status, ha="center", va="bottom",
-                    color=state_color, fontweight="bold", fontsize=8,
-                )
+                validation_statuses.append((position, status, state_color))
                 labels.append(
                     f'{item["axis"]}\nA: {item["reference_label"]}\nB: {item["candidate_label"]}'
                 )
@@ -681,12 +679,30 @@ class ArtifactWriter:
                 "PENDING"
             )
             plots[2].set_xticks(positions, labels)
-            plots[2].set_ylim(0.0, plot_highest + 0.3)
+            # Reserve the top fifth of the axes for bounded status badges. Keeping
+            # them in axes-relative coordinates prevents extreme residual ratios
+            # from pushing the annotation into the title, while the added data
+            # headroom keeps the badges clear of observations and confidence bars.
+            plots[2].set_ylim(0.0, max(1.0, plot_highest) * 1.25)
+            status_transform = plots[2].get_xaxis_transform()
+            for position, status, state_color in validation_statuses:
+                plots[2].text(
+                    position, 0.975, status, ha="center", va="top",
+                    transform=status_transform, clip_on=False,
+                    color=state_color, fontweight="bold", fontsize=8,
+                    bbox={
+                        "boxstyle": "round,pad=0.24", "facecolor": "white",
+                        "edgecolor": state_color, "linewidth": 0.8, "alpha": 0.96,
+                    },
+                )
             plots[2].set(
                 title=f"Held-out paired validation · {overall} · lower is better",
                 ylabel="Normalized resonant-band energy\n(axis reference mean = 1.0; display only)",
             )
-            plots[2].legend(frameon=False, fontsize=7, ncol=2, loc="upper right")
+            plots[2].legend(
+                frameon=False, fontsize=7, ncol=1, loc="center left",
+                bbox_to_anchor=(1.01, 0.5), borderaxespad=0.0,
+            )
         else:
             plots[2].set_xticks(positions, ["Validation pending"])
             plots[2].text(
