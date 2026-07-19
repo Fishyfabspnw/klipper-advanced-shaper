@@ -29,7 +29,7 @@ Clone the current alpha outside the Klipper source tree:
 
 ```sh
 cd ~
-git clone --branch feature/initial-alpha \
+git clone --branch main \
   https://github.com/Fishyfabspnw/klipper-advanced-shaper.git
 cd klipper-advanced-shaper
 ./scripts/install.sh
