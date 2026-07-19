@@ -40,8 +40,8 @@ def attenuation_improvement_ci(
     """Paired bootstrap CI for fractional energy reduction."""
     base = np.asarray(baseline_energy, dtype=np.float64)
     candidate = np.asarray(candidate_energy, dtype=np.float64)
-    if base.shape != candidate.shape or base.ndim != 1 or base.size < 3:
-        raise ValueError("matching arrays with at least three held-out repeats are required")
+    if base.shape != candidate.shape or base.ndim != 1 or base.size < 2:
+        raise ValueError("matching arrays with at least two held-out repeats are required")
     if np.any(base <= 0) or not np.all(np.isfinite(base)) or not np.all(np.isfinite(candidate)):
         raise ValueError("energies must be finite and baseline energy positive")
     improvements = 1.0 - candidate / base

@@ -12,7 +12,7 @@ import math
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -41,7 +41,7 @@ def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
 
 
-def _finite(value: Any) -> float | None:
+def _finite(value: Any) -> Optional[float]:
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -87,6 +87,127 @@ def _selected_candidate(details: Mapping[str, Any]) -> Mapping[str, Any]:
     return {}
 
 
+def _positive_frequency_max(values: Any) -> Optional[float]:
+    try:
+        frequencies = np.asarray(values, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    frequencies = frequencies[np.isfinite(frequencies) & (frequencies > 0.0)]
+    return float(np.max(frequencies)) if frequencies.size else None
+
+
+def _plot_frequency_ceiling(
+    details: Mapping[str, Any], fallback_frequencies: Any
+) -> Optional[float]:
+    """Bound display axes to measured sweep evidence, not sensor Nyquist bins."""
+    spectrogram = details.get("spectrogram", {})
+    if isinstance(spectrogram, Mapping) and bool(spectrogram.get("available")):
+        limit = _positive_frequency_max(spectrogram.get("frequency_hz", []))
+        if limit is not None:
+            return limit + max(5.0, limit * 0.05)
+    evidence_limits: list[float] = []
+    native_candidates = details.get("native_candidates", [])
+    if isinstance(native_candidates, Sequence) and not isinstance(
+        native_candidates, (str, bytes)
+    ):
+        for candidate in native_candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            response = candidate.get("native_frequency_response", {})
+            if not isinstance(response, Mapping):
+                continue
+            limit = _positive_frequency_max(response.get("frequency_hz", []))
+            if limit is not None:
+                evidence_limits.append(limit)
+    if evidence_limits:
+        measured_limit = max(evidence_limits)
+        return measured_limit + max(5.0, measured_limit * 0.05)
+    return _positive_frequency_max(fallback_frequencies)
+
+
+def _plot_candidate_subset(
+    details: Mapping[str, Any], limit: int = 5
+) -> tuple[Mapping[str, Any], ...]:
+    """Keep plots legible while full candidate data remains in JSON/CSV/HTML."""
+    candidates = details.get("candidates", [])
+    if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)):
+        return ()
+    usable = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, Mapping) and _finite(candidate.get("max_accel")) is not None
+    ]
+    if limit <= 0 or len(usable) <= limit:
+        return tuple(usable)
+    selected = str(details.get("selected", "")).lower()
+    ordered = sorted(
+        usable,
+        key=lambda candidate: (
+            str(candidate.get("name", "")).lower() != selected,
+            -float(candidate["max_accel"]),
+            str(candidate.get("name", "")),
+        ),
+    )
+    return tuple(ordered[:limit])
+
+
+def _plot_candidate_label(axis: str, name: str) -> str:
+    if "(" in name and name.endswith(")"):
+        family, arguments = name.split("(", 1)
+        return f"{axis} · {family}\n({arguments}"
+    return f"{axis} · {name}"
+
+
+def _selected_modeled_response(
+    details: Mapping[str, Any], frequencies: Any
+) -> Optional[np.ndarray]:
+    """Return the selected shaper response using recorded design parameters."""
+    grid = np.asarray(frequencies, dtype=float).reshape(-1)
+    if not grid.size or np.any(~np.isfinite(grid)) or np.any(grid < 0.0):
+        return None
+    selected = str(details.get("selected", ""))
+    selected_lower = selected.lower()
+    for candidate in details.get("native_candidates", []):
+        if not isinstance(candidate, Mapping):
+            continue
+        if str(candidate.get("name", "")).lower() != selected_lower:
+            continue
+        response = candidate.get("native_frequency_response", {})
+        if not isinstance(response, Mapping):
+            continue
+        response_frequency = np.asarray(response.get("frequency_hz", []), dtype=float)
+        response_ratio = np.asarray(response.get("response_ratio", []), dtype=float)
+        if len(response_frequency) and len(response_frequency) == len(response_ratio):
+            return np.interp(grid, response_frequency, response_ratio)
+    selected_candidate = _selected_candidate(details)
+    metadata = selected_candidate.get("metadata", {})
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    if not bool(metadata.get("parameterized")):
+        return None
+    try:
+        from .analysis.experimental import generalized_mzv_pulses, oscillator_response
+        from .shapers import parse_shaper_identifier
+
+        identifier = parse_shaper_identifier(selected)
+        if identifier.family != "mzv":
+            return None
+        arguments = identifier.argument_map()
+        amplitudes, pulse_times = generalized_mzv_pulses(
+            int(arguments["n"]),
+            identifier.mzv_spacing(),
+            float(selected_candidate["frequency"]),
+            float(metadata["design_damping_ratio"]),
+        )
+        return oscillator_response(
+            amplitudes,
+            pulse_times,
+            grid,
+            float(metadata["design_damping_ratio"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _status(report: Mapping[str, Any]) -> tuple[str, str, str]:
     value = str(report.get("status", "")).lower()
     validation = report.get("validation", {})
@@ -116,7 +237,7 @@ class ArtifactWriter:
         self,
         result_id: str,
         report: Mapping[str, Any],
-        raw_groups: Mapping[str, Mapping[str, list[Any]]] | None = None,
+        raw_groups: Optional[Mapping[str, Mapping[str, list[Any]]]] = None,
     ) -> dict[str, Any]:
         destination = self.root / result_id
         destination.mkdir(parents=True, exist_ok=True)
@@ -202,7 +323,9 @@ class ArtifactWriter:
         rows: list[list[Any]] = [[
             "axis", "candidate", "frequency_hz", "max_accel_mm_s2", "smoothing",
             "residual_vibration_fraction", "repeatability", "cross_axis_energy",
-            "sensitivity", "pareto", "selected",
+            "sensitivity", "residual_metric", "acceleration_evidence",
+            "resonance_validated_accel_mm_s2", "print_validated_accel_mm_s2",
+            "pareto", "selected",
         ]]
         for axis, details in _axes(report).items():
             if not isinstance(details, Mapping):
@@ -213,11 +336,17 @@ class ArtifactWriter:
                 if not isinstance(candidate, Mapping):
                     continue
                 name = str(candidate.get("name", ""))
+                metadata = candidate.get("metadata", {})
+                metadata = metadata if isinstance(metadata, Mapping) else {}
                 rows.append([
                     axis, name, candidate.get("frequency", ""), candidate.get("max_accel", ""),
                     candidate.get("smoothing", ""), candidate.get("residual_vibration", ""),
                     candidate.get("repeatability", ""), candidate.get("cross_axis_energy", ""),
-                    candidate.get("sensitivity", ""), str(name.lower() in pareto).lower(),
+                    candidate.get("sensitivity", ""), metadata.get("residual_metric", ""),
+                    metadata.get("acceleration_evidence", ""),
+                    metadata.get("resonance_validated_acceleration_mm_s2", ""),
+                    metadata.get("print_validated_acceleration_mm_s2", ""),
+                    str(name.lower() in pareto).lower(),
                     str(name.lower() == selected).lower(),
                 ])
         return rows
@@ -227,7 +356,7 @@ class ArtifactWriter:
         rows: list[list[Any]] = [[
             "axis", "baseline_energy", "shaped_energy", "attenuation_ci95_low",
             "attenuation_ci95_high", "reference_cross_axis_energy",
-            "candidate_cross_axis_energy", "cross_axis_regression", "passed",
+            "candidate_cross_axis_energy", "cross_axis_regression", "qc_passed", "passed",
         ]]
         for axis, values in _validation_axes(report).items():
             if not isinstance(values, Mapping):
@@ -240,7 +369,8 @@ class ArtifactWriter:
                 ci[0] if len(ci) else "", ci[1] if len(ci) > 1 else "",
                 values.get("reference_cross_axis_energy", ""),
                 values.get("candidate_cross_axis_energy", ""),
-                values.get("cross_axis_regression", ""), values.get("passed", ""),
+                values.get("cross_axis_regression", ""), values.get("qc_passed", ""),
+                values.get("passed", ""),
             ])
         return rows
 
@@ -270,8 +400,16 @@ class ArtifactWriter:
                 frequencies = np.asarray(spectrum.get("frequency_hz", []), dtype=float)
                 psd = np.asarray(spectrum.get("psd", []), dtype=float)
                 if len(frequencies) and len(frequencies) == len(psd):
-                    spectra.append((str(axis), frequencies, psd, details.get("modes", [])))
-        for index, (axis, frequencies, psd, modes) in enumerate(spectra):
+                    spectra.append(
+                        (
+                            str(axis),
+                            frequencies,
+                            psd,
+                            details.get("modes", []),
+                            _plot_frequency_ceiling(details, frequencies),
+                        )
+                    )
+        for index, (axis, frequencies, psd, modes, _ceiling) in enumerate(spectra):
             color = BLUE if index == 0 else ORANGE
             plots[0].semilogy(frequencies, np.maximum(psd, 1e-18), color=color, linewidth=1.8,
                               label=f"{axis} robust spectrum")
@@ -286,22 +424,32 @@ class ArtifactWriter:
                      ylabel="Power spectral density (acceleration²/Hz)")
         plots[0].grid(True, which="both", axis="y")
         if spectra:
+            ceilings = [item[4] for item in spectra if item[4] is not None]
+            if ceilings:
+                plots[0].set_xlim(0.0, max(ceilings))
             plots[0].legend(frameon=False, loc="upper right")
         else:
             plots[0].text(0.5, 0.5, "Spectrum not available", ha="center", va="center",
                           transform=plots[0].transAxes, color=SLATE)
 
         labels, accelerations, colors, hatches = [], [], [], []
+        hidden_candidates = 0
         for axis, details in _axes(report).items():
             if not isinstance(details, Mapping):
                 continue
             selected = str(details.get("selected", "")).lower()
-            for candidate in details.get("candidates", []):
-                if not isinstance(candidate, Mapping) or _finite(candidate.get("max_accel")) is None:
-                    continue
-                name = str(candidate.get("name", "")).upper()
+            candidates = details.get("candidates", [])
+            candidates = (
+                candidates
+                if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes))
+                else []
+            )
+            visible_candidates = _plot_candidate_subset(details)
+            hidden_candidates += max(0, len(candidates) - len(visible_candidates))
+            for candidate in visible_candidates:
+                name = str(candidate.get("name", ""))
                 is_selected = name.lower() == selected
-                labels.append(f"{axis} · {name}")
+                labels.append(_plot_candidate_label(str(axis), name))
                 accelerations.append(float(candidate["max_accel"]))
                 colors.append(BLUE if is_selected else "#cbd5e1")
                 hatches.append("" if is_selected else "//")
@@ -310,9 +458,17 @@ class ArtifactWriter:
         for bar, hatch, value in zip(bars, hatches, accelerations):
             bar.set_hatch(hatch)
             plots[1].text(bar.get_x() + bar.get_width() / 2, value, f"{value:,.0f}",
-                          ha="center", va="bottom", fontsize=8)
-        plots[1].set(title="Candidate comparison · solid blue is selected", ylabel="Smoothing-derived max accel (mm/s²)")
-        plots[1].tick_params(axis="x", rotation=28)
+                          ha="center", va="bottom", fontsize=7)
+        omitted = (
+            f" · {hidden_candidates} additional candidates in candidates.csv"
+            if hidden_candidates
+            else ""
+        )
+        plots[1].set(
+            title="Selected and highest theoretical-acceleration candidates" + omitted,
+            ylabel="Smoothing-derived max accel (mm/s²)",
+        )
+        plots[1].tick_params(axis="x", rotation=18, labelsize=8)
         plots[1].grid(True, axis="y")
 
         validation = _validation_axes(report)
@@ -377,14 +533,14 @@ class ArtifactWriter:
             gridspec_kw={"height_ratios": [2.0, 1.1] * axis_count},
         )
         figure.suptitle(
-            "Input shaper spectrum · measured spectral response and native-compatible candidates",
+            "INPUT SHAPER CALIBRATION TOOL · ADVANCED SHAPER",
             fontsize=16,
             fontweight="bold",
             x=0.06,
             ha="left",
         )
         trace_spec = (
-            ("psd_sum", "X+Y+Z", "#111827", "-", 1.8),
+            ("psd_sum", "X+Y+Z", "purple", "-", 1.8),
             ("psd_x", "X", "#dc2626", "-", 1.25),
             ("psd_y", "Y", "#16a34a", "-", 1.25),
             ("psd_z", "Z", "#2563eb", "-", 1.25),
@@ -398,31 +554,33 @@ class ArtifactWriter:
             frequencies = np.asarray(
                 spectrum.get("frequency_hz", spectrum.get("freq_bins", [])), dtype=float
             )
-            normalized_native = any(
-                key in spectrum for key in ("psd_sum", "psd_x", "psd_y", "psd_z")
-            )
+            frequency_ceiling = _plot_frequency_ceiling(details, frequencies)
             traces = 0
+            primary_psd = None
             for key, label, color, linestyle, linewidth in trace_spec:
                 values = np.asarray(spectrum.get(key, []), dtype=float)
                 if len(frequencies) and len(values) == len(frequencies):
-                    plot.semilogy(
+                    plot.plot(
                         frequencies,
-                        np.maximum(values, 1e-18),
+                        values,
                         label=label,
                         color=color,
                         linestyle=linestyle,
                         linewidth=linewidth,
                     )
+                    if key == "psd_sum":
+                        primary_psd = values
                     traces += 1
             fallback = np.asarray(spectrum.get("psd", []), dtype=float)
             if traces == 0 and len(frequencies) and len(fallback) == len(frequencies):
-                plot.semilogy(
+                plot.plot(
                     frequencies,
-                    np.maximum(fallback, 1e-18),
+                    fallback,
                     label=f"{axis} projected / aggregate response",
-                    color=BLUE,
+                    color="purple",
                     linewidth=1.8,
                 )
+                primary_psd = fallback
                 traces = 1
             response_plot = None
             response_lines = 0
@@ -439,71 +597,113 @@ class ArtifactWriter:
                     continue
                 if response_plot is None:
                     response_plot = plot.twinx()
-                    response_plot.set_ylabel("Modeled residual response ratio")
+                    response_plot.set_ylabel("Shaper vibration reduction (ratio)")
                     response_plot.set_ylim(bottom=0)
-                name = str(native_candidate.get("name", "")).upper()
+                name = str(native_candidate.get("name", ""))
                 frequency = native_candidate.get("frequency_hz")
                 is_selected = name.lower() == str(details.get("selected", "")).lower()
+                metrics = (
+                    f"{name.upper()} ({_number(frequency, 1)} Hz, "
+                    f"vibr={_percent(native_candidate.get('residual_vibration'), 1)}, "
+                    f"sm~={_number(native_candidate.get('smoothing'), 3)}, "
+                    f"accel<={_number(native_candidate.get('max_accel'), 0)})"
+                )
                 response_plot.plot(
                     response_frequency,
                     response_ratio,
-                    linestyle=":" if not is_selected else "--",
+                    linestyle=":" if not is_selected else "-.",
                     linewidth=2.0 if is_selected else 1.2,
                     color=response_colors[index % len(response_colors)],
+                    label=metrics,
+                )
+                response_lines += 1
+            selected_candidate = _selected_candidate(details)
+            selected_name = str(details.get("selected", "No selection"))
+            selected_response = _selected_modeled_response(details, frequencies)
+            native_names = {
+                str(candidate.get("name", "")).lower()
+                for candidate in details.get("native_candidates", [])
+                if isinstance(candidate, Mapping)
+            }
+            if selected_response is not None and selected_name.lower() not in native_names:
+                if response_plot is None:
+                    response_plot = plot.twinx()
+                    response_plot.set_ylabel("Shaper vibration reduction (ratio)")
+                    response_plot.set_ylim(0.0, 1.0)
+                response_plot.plot(
+                    frequencies,
+                    selected_response,
+                    linestyle="-.",
+                    linewidth=2.2,
+                    color="#06b6d4",
                     label=(
-                        f"{'Selected ' if is_selected else ''}{name} {_number(frequency, 1)} Hz"
+                        f"SELECTED {selected_name} "
+                        f"({_number(selected_candidate.get('frequency'), 1)} Hz, "
+                        f"vibr={_percent(selected_candidate.get('residual_vibration'), 1)}, "
+                        f"sm~={_number(selected_candidate.get('smoothing'), 3)}, "
+                        f"accel<={_number(selected_candidate.get('max_accel'), 0)})"
                     ),
                 )
                 response_lines += 1
+            if (
+                primary_psd is not None
+                and selected_response is not None
+                and len(primary_psd) == len(selected_response)
+            ):
+                plot.plot(
+                    frequencies,
+                    primary_psd * selected_response,
+                    color="#06b6d4",
+                    linewidth=1.6,
+                    label=f"With {selected_name} applied",
+                )
             for index, mode in enumerate(details.get("modes", []), start=1):
                 frequency = _finite(mode.get("frequency")) if isinstance(mode, Mapping) else None
                 if frequency is None:
                     continue
-                plot.axvline(frequency, color=ORANGE, linestyle="--", linewidth=0.9, alpha=0.8)
+                peak_height = (
+                    float(np.interp(frequency, frequencies, primary_psd))
+                    if primary_psd is not None and len(primary_psd) == len(frequencies)
+                    else 0.0
+                )
+                plot.plot(frequency, peak_height, "x", color="black", markersize=7)
                 plot.annotate(
-                    f"Peak {index}\n{frequency:.1f} Hz",
-                    (frequency, 0.94),
-                    xycoords=("data", "axes fraction"),
-                    ha="center",
-                    va="top",
-                    color=ORANGE,
-                    fontsize=8,
+                    str(index),
+                    (frequency, peak_height),
+                    textcoords="offset points",
+                    xytext=(7, 5),
+                    color="#ef4444",
+                    fontsize=11,
+                    fontweight="bold",
                 )
-            candidate_lines = []
-            selected = str(details.get("selected", "")).lower()
-            for candidate in details.get("candidates", []):
-                if not isinstance(candidate, Mapping):
-                    continue
-                name = str(candidate.get("name", "")).upper()
-                marker = "★" if name.lower() == selected else "•"
-                candidate_lines.append(
-                    f"{marker} {name} {_number(candidate.get('frequency'), 1)} Hz · "
-                    f"residual {_percent(candidate.get('residual_vibration'), 2)} · "
-                    f"smoothing {_number(candidate.get('smoothing'), 4)} · "
-                    f"accel {_number(candidate.get('max_accel'), 0)} mm/s²"
-                )
-            plot.text(
-                0.01,
-                0.02,
-                "\n".join(candidate_lines) or "Native candidate metrics unavailable",
-                transform=plot.transAxes,
-                ha="left",
-                va="bottom",
-                fontsize=8,
-                bbox={"boxstyle": "round,pad=.5", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.92},
+            metadata = selected_candidate.get("metadata", {})
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            primary_mode = next(
+                (
+                    _finite(mode.get("frequency"))
+                    for mode in details.get("modes", [])
+                    if isinstance(mode, Mapping) and _finite(mode.get("frequency")) is not None
+                ),
+                None,
+            )
+            title_context = (
+                f"ω0={_number(primary_mode, 1)} Hz, "
+                f"ζ={_number(metadata.get('design_damping_ratio'), 3)}"
             )
             plot.set(
-                title=f"Axis {axis} frequency profile",
+                title=f"Axis {axis} Frequency Profile ({title_context})",
                 xlabel="Frequency (Hz)",
-                ylabel=(
-                    "Normalized spectral response (arbitrary units)"
-                    if normalized_native
-                    else "Power spectral density (acceleration²/Hz)"
-                ),
+                ylabel="Power spectral density",
             )
-            plot.grid(True, which="both", axis="y")
+            plot.set_ylim(bottom=0.0)
+            plot.ticklabel_format(axis="y", style="scientific", scilimits=(0, 0))
+            plot.minorticks_on()
+            plot.grid(True, which="major", color="#94a3b8", linewidth=0.7)
+            plot.grid(True, which="minor", color="#e2e8f0", linewidth=0.5)
+            if frequency_ceiling is not None:
+                plot.set_xlim(0.0, frequency_ceiling)
             if traces:
-                plot.legend(frameon=False, loc="upper right", ncol=min(3, traces))
+                plot.legend(frameon=True, loc="upper left", fontsize=7)
             else:
                 plot.text(
                     0.5,
@@ -514,7 +714,10 @@ class ArtifactWriter:
                     color=SLATE,
                 )
             if response_plot is not None and response_lines:
-                response_plot.legend(frameon=False, loc="center right", fontsize=8)
+                if frequency_ceiling is not None:
+                    response_plot.set_xlim(0.0, frequency_ceiling)
+                response_plot.set_ylim(0.0, 1.0)
+                response_plot.legend(frameon=True, loc="upper right", fontsize=7)
 
             spectrogram = details.get("spectrogram", {})
             spectrogram = spectrogram if isinstance(spectrogram, Mapping) else {}
@@ -529,17 +732,35 @@ class ArtifactWriter:
             ):
                 decibels = 10.0 * np.log10(np.maximum(power, 1e-18))
                 image = spectrogram_plot.pcolormesh(
-                    times,
                     spectrogram_frequency,
-                    decibels,
+                    times,
+                    decibels.T,
                     shading="auto",
-                    cmap="cividis",
+                    cmap="inferno",
                 )
                 figure.colorbar(image, ax=spectrogram_plot, pad=0.01, label="Power (dB)")
+                for index, mode in enumerate(details.get("modes", []), start=1):
+                    frequency = _finite(mode.get("frequency")) if isinstance(mode, Mapping) else None
+                    if frequency is None:
+                        continue
+                    spectrogram_plot.axvline(
+                        frequency, color="#22d3ee", linestyle=":", linewidth=0.9
+                    )
+                    spectrogram_plot.annotate(
+                        f"Peak {index} ({frequency:.1f} Hz)",
+                        (frequency, times[-1] * 0.92),
+                        color="#22d3ee",
+                        rotation=90,
+                        ha="right",
+                        va="top",
+                        fontsize=7,
+                    )
+                if frequency_ceiling is not None:
+                    spectrogram_plot.set_xlim(0.0, frequency_ceiling)
                 spectrogram_plot.set(
-                    title=f"Axis {axis} time–frequency evidence",
-                    xlabel="Sweep time (s)",
-                    ylabel="Frequency (Hz)",
+                    title=f"Axis {axis} Time-Frequency Spectrogram",
+                    xlabel="Frequency (Hz)",
+                    ylabel="Time (s)",
                 )
             else:
                 reason = spectrogram.get("reason", "not present in this artifact")
@@ -560,7 +781,8 @@ class ArtifactWriter:
         figure.text(
             0.06,
             0.005,
-            "Only measured traces present in the report are drawn; unavailable X/Y/Z components are not synthesized.",
+            "Only measured traces are drawn; unavailable components are not synthesized. "
+            "Complete candidate metrics are preserved in candidates.csv.",
             color=SLATE,
             fontsize=8,
         )
@@ -600,7 +822,7 @@ class ArtifactWriter:
             if not isinstance(details, Mapping):
                 continue
             candidate = _selected_candidate(details)
-            selected = str(details.get("selected", "No selection")).upper()
+            selected = str(details.get("selected", "No selection"))
             frequency = candidate.get("frequency")
             cards.append((str(axis), selected, _number(frequency, 1, "—") + " Hz",
                           _number(candidate.get("max_accel"), 0, "—") + " mm/s²"))
@@ -641,20 +863,43 @@ class ArtifactWriter:
         validation_rows = []
         candidate_rows = []
         cards = []
+        protocol = report.get("validation_protocol", {})
+        protocol = protocol if isinstance(protocol, Mapping) else {}
+        if protocol:
+            if protocol.get("mode") == "fast_lower_confidence_2_repeat":
+                protocol_label = "Lower-confidence fast validation"
+            elif protocol.get("lower_confidence"):
+                protocol_label = "Lower-confidence validation"
+            else:
+                protocol_label = "Full-confidence validation"
+            motion_seconds = _finite(protocol.get("estimated_motion_seconds_per_axis"))
+            motion_minutes = motion_seconds / 60.0 if motion_seconds is not None else None
+            cards.append(
+                f'''<article class="metric"><span>Validation protocol</span><strong>{_escape(protocol_label)}</strong><small>{_escape(protocol.get("repeats_per_group", "-"))} repeats/group | {_number(motion_minutes, 1)} min estimated motion/axis</small></article>'''
+            )
+            findings.append(
+                f"Validation protocol: <strong>{_escape(protocol_label)}</strong>; "
+                "the motion estimate excludes host analysis and artifact time."
+            )
         for axis, details in _axes(report).items():
             if not isinstance(details, Mapping):
                 continue
             candidate = _selected_candidate(details)
-            selected = str(details.get("selected", "No selection")).upper()
+            selected = str(details.get("selected", "No selection"))
             frequency = candidate.get("frequency")
             max_accel = candidate.get("max_accel")
+            acceleration_limits = details.get("acceleration_limits", {})
+            if not isinstance(acceleration_limits, Mapping):
+                acceleration_limits = {}
+            resonance_accel = acceleration_limits.get("resonance_validated_mm_s2")
+            print_accel = acceleration_limits.get("print_validated_mm_s2")
             modes = [item for item in details.get("modes", []) if isinstance(item, Mapping)]
             mode_text = ", ".join(f"{_number(item.get('frequency'), 1)} Hz" for item in modes[:4]) or "None identified"
             cards.append(f'''<article class="metric"><span>Axis {_escape(axis)} selection</span><strong>{_escape(selected)}</strong><small>{_number(frequency, 1)} Hz · {_number(max_accel, 0)} mm/s²</small></article>''')
-            findings.append(f"Axis {_escape(axis)} selected <strong>{_escape(selected)}</strong> at {_number(frequency, 1)} Hz from the native-compatible candidate set.")
+            findings.append(f"Axis {_escape(axis)} selected <strong>{_escape(selected)}</strong> at {_number(frequency, 1)} Hz from the allowlisted candidate set.")
             qc_rows = details.get("qc", [])
             qc_pass = bool(qc_rows) and all(bool(row.get("passed")) for row in qc_rows if isinstance(row, Mapping))
-            axis_sections.append(f'''<article class="axis-card"><div><span class="eyebrow">AXIS {_escape(axis)}</span><h3>{_escape(selected)} · {_number(frequency, 1)} Hz</h3></div><dl><div><dt>Max accel estimate</dt><dd>{_number(max_accel, 0)} mm/s²</dd></div><div><dt>Residual vibration</dt><dd>{_percent(candidate.get("residual_vibration"), 2)}</dd></div><div><dt>Smoothing</dt><dd>{_number(candidate.get("smoothing"), 4)}</dd></div><div><dt>QC</dt><dd>{"Passed" if qc_pass else "Review details"}</dd></div><div><dt>Modes</dt><dd>{mode_text}</dd></div></dl></article>''')
+            axis_sections.append(f'''<article class="axis-card"><div><span class="eyebrow">AXIS {_escape(axis)}</span><h3>{_escape(selected)} · {_number(frequency, 1)} Hz</h3></div><dl><div><dt>Theoretical smoothing accel</dt><dd>{_number(max_accel, 0)} mm/s²</dd></div><div><dt>Resonance-validated accel</dt><dd>{_number(resonance_accel, 0, "Not validated")}</dd></div><div><dt>Print-validated accel</dt><dd>{_number(print_accel, 0, "Not validated")}</dd></div><div><dt>Residual vibration</dt><dd>{_percent(candidate.get("residual_vibration"), 2)}</dd></div><div><dt>Smoothing</dt><dd>{_number(candidate.get("smoothing"), 4)}</dd></div><div><dt>QC</dt><dd>{"Passed" if qc_pass else "Review details"}</dd></div><div><dt>Modes</dt><dd>{mode_text}</dd></div></dl></article>''')
             pareto = {str(item).lower() for item in details.get("pareto", [])}
             for item in details.get("candidates", []):
                 if not isinstance(item, Mapping):
@@ -662,7 +907,7 @@ class ArtifactWriter:
                 name = str(item.get("name", ""))
                 selected_mark = "<span class='tag selected'>Selected</span>" if name.lower() == str(details.get("selected", "")).lower() else ""
                 frontier_mark = "<span class='tag'>Pareto</span>" if name.lower() in pareto else ""
-                candidate_rows.append(f'''<tr><th scope="row">{_escape(axis)} · {_escape(name.upper())} {selected_mark}{frontier_mark}</th><td>{_number(item.get("frequency"), 1)}</td><td>{_number(item.get("max_accel"), 0)}</td><td>{_percent(item.get("residual_vibration"), 2)}</td><td>{_number(item.get("smoothing"), 4)}</td><td>{_percent(item.get("repeatability"), 2)}</td><td>{_percent(item.get("cross_axis_energy"), 2)}</td><td>{_percent(item.get("sensitivity"), 2)}</td></tr>''')
+                candidate_rows.append(f'''<tr><th scope="row">{_escape(axis)} · {_escape(name)} {selected_mark}{frontier_mark}</th><td>{_number(item.get("frequency"), 1)}</td><td>{_number(item.get("max_accel"), 0)}</td><td>{_percent(item.get("residual_vibration"), 2)}</td><td>{_number(item.get("smoothing"), 4)}</td><td>{_percent(item.get("repeatability"), 2)}</td><td>{_percent(item.get("cross_axis_energy"), 2)}</td><td>{_percent(item.get("sensitivity"), 2)}</td></tr>''')
 
         for axis, values in _validation_axes(report).items():
             if not isinstance(values, Mapping):
@@ -698,6 +943,11 @@ class ArtifactWriter:
             value = report.get(key)
             if value not in (None, ""):
                 audit_items.append(f"<div><dt>{label}</dt><dd>{_escape(value)}</dd></div>")
+        if protocol:
+            audit_items.append(
+                "<div><dt>Validation</dt><dd>%s</dd></div>"
+                % _escape(protocol.get("mode", "unknown"))
+            )
         payload = html.escape(json.dumps(report, indent=2, sort_keys=True), quote=False)
         validation_body = "".join(validation_rows) or '<tr><td colspan="6" class="empty">Held-out validation is not available for this report.</td></tr>'
         candidate_body = "".join(candidate_rows) or '<tr><td colspan="8" class="empty">Candidate metrics are not available.</td></tr>'
@@ -724,7 +974,7 @@ class ArtifactWriter:
 <header class="hero {tone}"><span class="status">{_escape(title)}</span><div class="eyebrow">KLIPPER ADVANCED SHAPER · TECHNICAL CALIBRATION REPORT</div><h1>Measured shaping evidence,<br>ready for a decision.</h1><p class="lede">{_escape(reason)}</p>{'<div class="warning">This result is rejected and cannot be applied or staged.</div>' if tone == 'rejected' else ''}<div class="metrics">{cards_body}</div></header>
 <section aria-labelledby="findings"><h2 id="findings">Technical summary</h2><ol class="findings">{findings_body}</ol></section>
 <section aria-labelledby="axis"><h2 id="axis">Selection and modal evidence</h2><div class="axis-grid">{axis_body}</div></section>
-<section aria-labelledby="spectrum"><h2 id="spectrum">Input shaper spectrum</h2><p>Klipper-compatible frequency view of the normalized spectral response and evaluated native candidates. Native component values are unitless normalized or arbitrary response units, not acceleration²/Hz. <a href="{_escape(shaper_svg_name)}">Open the scalable SVG</a>.</p><div class="figure"><img src="{_escape(shaper_png_name)}" alt="Input shaper frequency profile with normalized spectral response traces, detected modal peaks, and native-compatible candidate metrics"></div></section>
+<section aria-labelledby="spectrum"><h2 id="spectrum">Input shaper spectrum</h2><p>Klipper-compatible frequency view of the normalized spectral response and evaluated allowlisted candidates. Native component values are unitless normalized or arbitrary response units, not acceleration²/Hz. <a href="{_escape(shaper_svg_name)}">Open the scalable SVG</a>.</p><div class="figure"><img src="{_escape(shaper_png_name)}" alt="Input shaper frequency profile with normalized spectral response traces, detected modal peaks, and allowlisted candidate metrics"></div></section>
 <section aria-labelledby="validation"><h2 id="validation">Before / after held-out validation</h2><div class="table-wrap"><table><thead><tr><th>Axis</th><th>Reference energy</th><th>Shaped energy</th><th>Attenuation 95% CI</th><th>Cross-axis change</th><th>Gate</th></tr></thead><tbody>{validation_body}</tbody></table></div></section>
 <section aria-labelledby="plots"><h2 id="plots">PSD, candidates, and validation plots</h2><div class="figure"><img src="{_escape(png_name)}" alt="Three technical plots showing modal spectrum, candidate acceleration estimates, and held-out reference versus shaped energy"></div></section>
 <section aria-labelledby="candidates"><h2 id="candidates">Candidate and Pareto comparison</h2><div class="table-wrap"><table><thead><tr><th>Candidate</th><th>Hz</th><th>Max accel mm/s²</th><th>Residual</th><th>Smoothing</th><th>Repeatability</th><th>Cross-axis</th><th>Sensitivity</th></tr></thead><tbody>{candidate_body}</tbody></table></div></section>

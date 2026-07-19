@@ -6,6 +6,7 @@ from .experimental import (
     acceleration_envelope,
     optimize_generalized_mzv,
     prove_runtime_generalized_mzv,
+    prove_runtime_native_shapers,
 )
 from .facade import analyze_calibration
 from .models import (
@@ -54,6 +55,7 @@ __all__ = [
     "pareto_frontier",
     "project_axes",
     "prove_runtime_generalized_mzv",
+    "prove_runtime_native_shapers",
     "integrated_band_energy",
     "resample_uniform",
     "select_candidate",

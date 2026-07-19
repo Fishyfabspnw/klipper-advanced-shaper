@@ -29,3 +29,16 @@ The attempt directory contains:
 Raw accelerometer samples are never exported to CSV by default. Rejected
 attempts are clearly labeled and are retained only for diagnosis; they cannot
 be applied or staged.
+
+Parameterized results retain the canonical shaper identifier, installed-runtime
+capability proof, measured design damping and uncertainty samples, and held-out
+QC/confidence/cross-axis evidence. Acceleration fields distinguish theoretical
+smoothing, resonance-validated, and print-validated values; absent physical
+evidence is recorded as unavailable rather than inferred from the model.
+Every completed analysis also records the resolved excitation source and value,
+maximum sweep frequency, sweeping acceleration, current printer acceleration
+limit, 80% budget, and estimated peak used by the pre-motion safety check.
+The validation protocol block labels full-confidence versus lower-confidence
+fast validation, repeat and sweep counts, effective Hz/s, and estimated physical
+motion time per axis. This timing deliberately excludes host analysis, report
+rendering, and artifact I/O.

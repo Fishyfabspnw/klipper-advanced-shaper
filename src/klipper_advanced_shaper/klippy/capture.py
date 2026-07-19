@@ -5,9 +5,11 @@ from __future__ import annotations
 import importlib
 import inspect
 import time
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
+
+from .excitation import check_motion_budget, check_sweep_rate
 
 _MAX_REPORT_FREQUENCY_BINS = 1024
 
@@ -51,7 +53,10 @@ def _native_spectrum(data: Any) -> dict[str, Any]:
 
 
 def _native_candidate(
-    item: Any, calibration_frequency_bins: Any = None, max_frequency: Any = None
+    item: Any,
+    calibration_frequency_bins: Any = None,
+    max_frequency: Any = None,
+    design_damping_ratio: Any = None,
 ) -> dict[str, Any]:
     result = {
         "name": item.name,
@@ -60,6 +65,8 @@ def _native_candidate(
         "smoothing": float(item.smoothing),
         "max_accel": float(item.max_accel),
     }
+    if design_damping_ratio is not None:
+        result["design_damping_ratio"] = float(design_damping_ratio)
     if hasattr(item, "vals"):
         try:
             candidate_bins = getattr(item, "freq_bins", None)
@@ -95,9 +102,17 @@ def _native_candidate(
 
 
 class _Command:
-    def __init__(self, validation: bool, responder: Any) -> None:
+    def __init__(
+        self,
+        validation: bool,
+        responder: Any,
+        accel_per_hz: Optional[float] = None,
+        hz_per_sec: Optional[float] = None,
+    ) -> None:
         self.validation = validation
         self.responder = responder
+        self.accel_per_hz = accel_per_hz
+        self.hz_per_sec = hz_per_sec
 
     def get(self, name: str, default: Any = None) -> Any:
         if name == "INPUT_SHAPING":
@@ -109,7 +124,11 @@ class _Command:
             return int(self.validation)
         return int(default)
 
-    def get_float(self, _name: str, default: float, **_: Any) -> float:
+    def get_float(self, name: str, default: float, **_: Any) -> float:
+        if name == "ACCEL_PER_HZ" and self.accel_per_hz is not None:
+            return self.accel_per_hz
+        if name == "HZ_PER_SEC" and self.hz_per_sec is not None:
+            return self.hz_per_sec
         return float(default)
 
     def respond_info(self, message: str) -> None:
@@ -185,14 +204,85 @@ class NativeResonanceCaptureProvider:
         if not getattr(tester, "accel_chips", None):
             raise RuntimeError("no connected resonance accelerometer")
 
-    def capture(self, axis: str, repeat: int, validation: bool = False) -> dict[str, Any]:
+    def preflight_excitation(
+        self,
+        axes: tuple[str, ...],
+        accel_per_hz: Optional[float],
+        hz_per_sec: Optional[float],
+    ) -> dict[str, Any]:
+        if not axes or any(axis not in {"X", "Y"} for axis in axes):
+            raise RuntimeError("resonance excitation preflight supports only X and Y")
+        tester = self._tester()
+        generator = tester.generator
+        pulse = getattr(generator, "vibration_generator", generator)
+        effective = (
+            accel_per_hz
+            if accel_per_hz is not None
+            else getattr(pulse, "accel_per_hz", None)
+        )
+        max_frequency = getattr(pulse, "max_freq", getattr(pulse, "freq_end", None))
+        min_frequency = getattr(pulse, "min_freq", None)
+        sweeping_accel = getattr(generator, "sweeping_accel", 0.0)
+        eventtime = self.printer.get_reactor().monotonic()
+        motion_limit = self.printer.lookup_object("toolhead").get_status(eventtime).get(
+            "max_accel"
+        )
+        result = dict(
+            check_motion_budget(
+                effective,
+                max_frequency,
+                motion_limit,
+                sweeping_accel,
+            )
+        )
+        result["source"] = "command" if accel_per_hz is not None else "resonance_tester"
+        effective_hz_per_sec = (
+            hz_per_sec
+            if hz_per_sec is not None
+            else getattr(pulse, "hz_per_sec", None)
+        )
+        result["hz_per_sec"] = check_sweep_rate(effective_hz_per_sec)
+        try:
+            result["min_frequency_hz"] = float(min_frequency)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("resonance minimum frequency is unavailable") from error
+        if (
+            not np.isfinite(result["min_frequency_hz"])
+            or result["min_frequency_hz"] <= 0.0
+            or result["min_frequency_hz"] >= result["max_frequency_hz"]
+        ):
+            raise RuntimeError("resonance frequency range is invalid")
+        result["hz_per_sec_source"] = (
+            "command" if hz_per_sec is not None else "resonance_tester"
+        )
+        result["axes"] = list(axes)
+        return result
+
+    def capture(
+        self,
+        axis: str,
+        repeat: int,
+        validation: bool = False,
+        accel_per_hz: Optional[float] = None,
+        hz_per_sec: Optional[float] = None,
+        design_damping_ratio: Optional[float] = None,
+    ) -> dict[str, Any]:
+        if design_damping_ratio is None or not np.isfinite(design_damping_ratio):
+            raise RuntimeError("active input-shaper damping is required for native fitting")
+        if not 0.0 <= float(design_damping_ratio) < 1.0:
+            raise RuntimeError("active input-shaper damping must be within [0, 1)")
         tester = self._tester()
         module = importlib.import_module(tester.__class__.__module__)
         test_axis = module.TestAxis(axis.lower())
         native_module = importlib.import_module("extras.shaper_calibrate")
         native_helper = native_module.ShaperCalibrate(self.printer)
         helper = _CaptureHelper(native_helper)
-        command = _Command(validation, self.gcode.respond_info)
+        command = _Command(
+            validation,
+            self.gcode.respond_info,
+            accel_per_hz,
+            hz_per_sec,
+        )
         run_parameters = inspect.signature(tester._run_test).parameters
         run_kwargs = {}
         if "name_suffix" in run_parameters:
@@ -210,6 +300,7 @@ class NativeResonanceCaptureProvider:
         max_frequency = tester._get_max_calibration_freq()
         _best, candidates = native_helper.find_best_shaper(
             data,
+            damping_ratio=float(design_damping_ratio),
             max_smoothing=getattr(tester, "max_smoothing", None),
             scv=scv,
             max_freq=max_frequency,
@@ -222,6 +313,7 @@ class NativeResonanceCaptureProvider:
                 item,
                 getattr(data, "freq_bins", None),
                 max_frequency,
+                design_damping_ratio,
             )
             for item in candidates
         ]
@@ -244,6 +336,8 @@ class NativeResonanceCaptureProvider:
                 "accel_per_hz": float(getattr(pulse, "test_accel_per_hz", 0.0)),
                 "hz_per_sec": float(getattr(pulse, "test_hz_per_sec", 0.0)),
             },
+            "native_design_damping_ratio": float(design_damping_ratio),
+            "native_design_damping_source": "active_input_shaper_status",
         }
         result.pop("native_data", None)
         return result

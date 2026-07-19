@@ -48,6 +48,30 @@ PROFILES: Dict[str, SelectionProfile] = {
         },
         maximum_residual=0.20,
     ),
+    "experimental_mzv": SelectionProfile(
+        "experimental_mzv",
+        {
+            "max_accel": 0.38,
+            "smoothing": 0.24,
+            "residual_vibration": 0.18,
+            "repeatability": 0.08,
+            "cross_axis_energy": 0.07,
+            "sensitivity": 0.05,
+        },
+        maximum_residual=0.10,
+    ),
+    "adaptive_stock": SelectionProfile(
+        "adaptive_stock",
+        {
+            "max_accel": 0.34,
+            "smoothing": 0.22,
+            "residual_vibration": 0.22,
+            "repeatability": 0.09,
+            "cross_axis_energy": 0.08,
+            "sensitivity": 0.07,
+        },
+        maximum_residual=0.10,
+    ),
 }
 
 

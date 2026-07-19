@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from klipper_advanced_shaper import __version__
+from klipper_advanced_shaper.shapers import parse_shaper_identifier
 
+from .experimental import damping_samples, optimize_generalized_mzv
 from .models import CandidateScore, Spectrum
 from .modes import find_modes
 from .selection import PROFILES, select_candidate
@@ -80,7 +82,10 @@ def _axis_spectra(
 
 
 def _candidate_scores(
-    captures: Sequence[Mapping[str, Any]], repeatability: float, cross_ratio: float
+    captures: Sequence[Mapping[str, Any]],
+    repeatability: float,
+    cross_ratio: float,
+    comparison_spectrum: Optional[Spectrum] = None,
 ) -> list[CandidateScore]:
     grouped: dict[str, list[Mapping[str, Any]]] = {}
     for capture in captures:
@@ -89,18 +94,73 @@ def _candidate_scores(
     scores = []
     for name, rows in grouped.items():
         frequency = np.asarray([float(row["frequency"]) for row in rows])
+        residuals = [float(row["residual_vibration"]) for row in rows]
+        residual_metric = "klipper_native_vibration_fraction"
+        sensitivity = float(np.ptp(frequency) / max(np.mean(frequency), 1e-9))
+        if comparison_spectrum is not None:
+            common_residuals = []
+            power = np.asarray(comparison_spectrum.values, dtype=float)
+            threshold = float(np.max(power)) / 20.0
+            denominator = float(np.sum(np.maximum(power - threshold, 0.0)))
+            if denominator <= 0.0:
+                continue
+            for row in rows:
+                response = row.get("native_frequency_response")
+                if not isinstance(response, Mapping):
+                    common_residuals = []
+                    break
+                try:
+                    values = np.interp(
+                        comparison_spectrum.frequencies,
+                        np.asarray(response["frequency_hz"], dtype=float),
+                        np.asarray(response["response_ratio"], dtype=float),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    common_residuals = []
+                    break
+                if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+                    common_residuals = []
+                    break
+                common_residuals.append(
+                    float(np.sum(np.maximum(values * power - threshold, 0.0)))
+                    / denominator
+                )
+            if len(common_residuals) != len(rows):
+                continue
+            residuals = common_residuals
+            residual_metric = "common_klipper_thresholded_vibration_fraction"
+            sensitivity = float(np.ptp(common_residuals))
         scores.append(
             CandidateScore(
                 name=name,
                 frequency=float(np.median(frequency)),
-                residual_vibration=float(np.median([row["residual_vibration"] for row in rows])),
+                residual_vibration=float(np.median(residuals)),
                 smoothing=float(np.median([row["smoothing"] for row in rows])),
                 max_accel=float(np.median([row["max_accel"] for row in rows])),
                 repeatability=max(
                     repeatability, float(np.std(frequency) / max(np.mean(frequency), 1e-9))
                 ),
                 cross_axis_energy=cross_ratio,
-                sensitivity=float(np.ptp(frequency) / max(np.mean(frequency), 1e-9)),
+                sensitivity=sensitivity,
+                metadata={
+                    "family": "native",
+                    "parameterized": False,
+                    "residual_metric": residual_metric,
+                    "upstream_residual_vibration": float(
+                        np.median([row["residual_vibration"] for row in rows])
+                    ),
+                    "design_damping_ratio": (
+                        float(np.median([row["design_damping_ratio"] for row in rows]))
+                        if all("design_damping_ratio" in row for row in rows)
+                        else None
+                    ),
+                    "theoretical_smoothing_acceleration_mm_s2": float(
+                        np.median([row["max_accel"] for row in rows])
+                    ),
+                    "resonance_validated_acceleration_mm_s2": None,
+                    "print_validated_acceleration_mm_s2": None,
+                    "acceleration_evidence": "theoretical",
+                },
             )
         )
     return scores
@@ -176,6 +236,10 @@ def _native_candidate_summary(captures: Sequence[Mapping[str, Any]]) -> list[dic
             "max_accel": float(np.median([row["max_accel"] for row in rows])),
             "repeat_count": len(rows),
         }
+        if all("design_damping_ratio" in row for row in rows):
+            summary["design_damping_ratio"] = float(
+                np.median([row["design_damping_ratio"] for row in rows])
+            )
         responses = [row.get("native_frequency_response") for row in rows]
         if responses and all(isinstance(response, Mapping) for response in responses):
             try:
@@ -274,17 +338,17 @@ def _spectrogram(capture: Mapping[str, Any], axis: str) -> dict[str, Any]:
 
 def _energies(
     captures: Sequence[Mapping[str, Any]], axis: str, bands: Sequence[tuple[float, float]]
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], list[dict[str, Any]]]:
     along, cross, quality = _axis_spectra(captures, axis)
     if len(along) != len(captures) or any(not row["passed"] for row in quality):
-        raise ValueError("held-out capture failed quality checks")
+        return None, None, quality
     along_energy = np.asarray(
         [sum(integrated_band_energy(item, low, high) for low, high in bands) for item in along]
     )
     cross_energy = np.asarray(
         [sum(integrated_band_energy(item, low, high) for low, high in bands) for item in cross]
     )
-    return along_energy, cross_energy
+    return along_energy, cross_energy, quality
 
 
 def analyze_calibration(
@@ -293,11 +357,19 @@ def analyze_calibration(
     axes: Sequence[str],
     profile: str,
     snapshot: Any,
-    held_out_captures: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
-    validation_captures: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
-    prior_report: Mapping[str, Any] | None = None,
+    held_out_captures: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
+    validation_captures: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
+    prior_report: Optional[Mapping[str, Any]] = None,
+    experimental_mode: bool = False,
+    executor_pulse_limit: int = 10,
+    peak_lock: bool = False,
 ) -> dict[str, Any]:
     """Analyze training captures or judge shaped captures against held-out baselines."""
+    if peak_lock and not experimental_mode:
+        return {
+            "abstain": True,
+            "reason": "strongest-peak locking is only supported in adaptive stock modes",
+        }
     if validation_captures is not None:
         details = {}
         passed = True
@@ -308,8 +380,32 @@ def analyze_calibration(
             ]
             if not bands:
                 return {"validation": {"passed": False, "reason": "no modal bands"}}
-            baseline, baseline_cross = _energies(held_out_captures[axis], axis, bands)
-            shaped, shaped_cross = _energies(validation_captures[axis], axis, bands)
+            try:
+                baseline, baseline_cross, reference_qc = _energies(
+                    held_out_captures[axis], axis, bands
+                )
+                shaped, shaped_cross, candidate_qc = _energies(
+                    validation_captures[axis], axis, bands
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                details[axis] = {
+                    "passed": False,
+                    "qc_passed": False,
+                    "reason": str(error),
+                }
+                passed = False
+                continue
+            if baseline is None or shaped is None:
+                details[axis] = {
+                    "passed": False,
+                    "qc_passed": False,
+                    "reason": "held-out capture failed quality checks",
+                    "reference_qc": reference_qc,
+                    "candidate_qc": candidate_qc,
+                }
+                passed = False
+                continue
+            assert baseline_cross is not None and shaped_cross is not None
             low, high = attenuation_improvement_ci(baseline, shaped)
             cross_regression = float(
                 (np.mean(shaped_cross) - np.mean(baseline_cross))
@@ -324,6 +420,9 @@ def analyze_calibration(
                 "reference_cross_axis_energy": float(np.mean(baseline_cross)),
                 "candidate_cross_axis_energy": float(np.mean(shaped_cross)),
                 "cross_axis_regression": cross_regression,
+                "qc_passed": True,
+                "reference_qc": reference_qc,
+                "candidate_qc": candidate_qc,
                 "passed": axis_passed,
             }
         return {
@@ -332,16 +431,18 @@ def analyze_calibration(
                 "axes": details,
                 "reason": None
                 if passed
-                else "10% attenuation or 5% cross-axis regression gate not met",
+                else "QC, 10% attenuation, or 5% cross-axis regression gate not met",
             }
         }
 
     report: dict[str, Any] = {
-        "schema_version": "1.0.0-alpha.1",
+        "schema_version": "1.0.0-alpha.2",
         "engine": "robust_v1+running_klipper_reference",
         "plugin_version": __version__,
         "provenance": dict(captures[axes[0]][0].get("metadata", {})),
         "profile": profile,
+        "experimental_mode": bool(experimental_mode),
+        "peak_lock": bool(peak_lock),
         "square_corner_velocity": float(snapshot.square_corner_velocity),
         "axes": {},
         "selections": [],
@@ -360,14 +461,149 @@ def analyze_calibration(
             cross_aggregate, 5.0, min(200.0, cross_aggregate.frequencies[-1])
         )
         scores = _candidate_scores(
-            captures[axis], float(np.median(mad)), cross_energy / max(main_energy, 1e-12)
+            captures[axis],
+            float(np.median(mad)),
+            cross_energy / max(main_energy, 1e-12),
+            aggregate if profile == "adaptive_stock" else None,
         )
         if not scores:
             return {"abstain": True, "reason": "%s native candidate data unavailable" % axis}
-        chosen = select_candidate(scores, PROFILES[profile])
+        measured_damping = [
+            float(mode.damping_ratio)
+            for mode in modes
+            if mode.damping_ratio is not None and 0.0 < float(mode.damping_ratio) < 1.0
+        ]
+        snapshot_damping = float(getattr(snapshot, "damping_ratio_" + axis.lower()))
+        measured_design_damping = (
+            float(np.median(measured_damping)) if measured_damping else snapshot_damping
+        )
+        damping_uncertainty_samples = (
+            damping_samples([asdict(mode) for mode in modes]).tolist()
+            if measured_damping
+            else [snapshot_damping]
+        )
+        generalized_report: Optional[dict[str, Any]] = None
+        if experimental_mode:
+            if not 3 <= int(executor_pulse_limit) <= 10:
+                return {
+                    "abstain": True,
+                    "reason": "%s installed executor pulse limit is unsupported" % axis,
+                }
+            if not measured_damping:
+                return {
+                    "abstain": True,
+                    "reason": "%s experimental fitting requires measured damping" % axis,
+                }
+            try:
+                strongest_mode = max(modes, key=lambda mode: float(mode.amplitude))
+                peak_frequency = float(strongest_mode.frequency) if peak_lock else None
+                generalized_report = optimize_generalized_mzv(
+                    aggregate.frequencies,
+                    aggregate.values,
+                    [asdict(mode) for mode in modes],
+                    float(snapshot.square_corner_velocity),
+                    pulse_counts=range(3, int(executor_pulse_limit) + 1),
+                    fixed_frequency_hz=peak_frequency,
+                )
+            except (TypeError, ValueError, np.linalg.LinAlgError) as error:
+                return {
+                    "abstain": True,
+                    "reason": "%s generalized-MZV optimization failed: %s" % (axis, error),
+                }
+            generalized_by_name: dict[str, Mapping[str, Any]] = {}
+            for item in generalized_report.get("pareto", []):
+                identifier = parse_shaper_identifier(str(item["shaper_type"]))
+                current = generalized_by_name.get(identifier.canonical)
+                if current is None or (
+                    float(item["smoothing_max_accel"]),
+                    -float(item["residual_energy_q95"]),
+                    -float(item["sensitivity"]),
+                ) > (
+                    float(current["smoothing_max_accel"]),
+                    -float(current["residual_energy_q95"]),
+                    -float(current["sensitivity"]),
+                ):
+                    generalized_by_name[identifier.canonical] = item
+            generalized_report["selection_candidate_count"] = len(generalized_by_name)
+            generalized_report["peak_lock_enabled"] = bool(peak_lock)
+            generalized_report["strongest_measured_peak_hz"] = float(
+                max(modes, key=lambda mode: float(mode.amplitude)).frequency
+            )
+            for canonical, item in generalized_by_name.items():
+                theoretical = float(item["smoothing_max_accel"])
+                scores.append(
+                    CandidateScore(
+                        name=canonical,
+                        frequency=float(item["frequency_hz"]),
+                        residual_vibration=float(
+                            item["klipper_remaining_vibration"]
+                            if profile == "adaptive_stock"
+                            else item["residual_energy_q95"]
+                        ),
+                        smoothing=float(item["path_error_at_5000"]),
+                        max_accel=theoretical,
+                        repeatability=float(np.median(mad)),
+                        cross_axis_energy=cross_energy / max(main_energy, 1e-12),
+                        sensitivity=float(item["sensitivity"]),
+                        metadata={
+                            "family": "generalized_mzv",
+                            "parameterized": True,
+                            "residual_metric": (
+                                "common_klipper_thresholded_vibration_fraction"
+                                if profile == "adaptive_stock"
+                                else "psd_weighted_squared_response_q95"
+                            ),
+                            "robust_residual_energy_q95": float(
+                                item["residual_energy_q95"]
+                            ),
+                            "pulse_count": int(item["pulse_count"]),
+                            "spacing": float(item["spacing"]),
+                            "design_damping_ratio": float(item["design_damping_ratio"]),
+                            "damping_uncertainty_samples": list(
+                                generalized_report["measured_damping_samples"]
+                            ),
+                            "theoretical_smoothing_acceleration_mm_s2": theoretical,
+                            "resonance_validated_acceleration_mm_s2": None,
+                            "print_validated_acceleration_mm_s2": None,
+                            "acceleration_evidence": "theoretical",
+                            "frequency_strategy": generalized_report["frequency_strategy"],
+                            "strongest_measured_peak_hz": generalized_report[
+                                "strongest_measured_peak_hz"
+                            ],
+                        },
+                    )
+                )
+        selection_pool = (
+            [item for item in scores if item.metadata.get("parameterized")]
+            if profile == "experimental_mzv"
+            else scores
+        )
+        if profile == "experimental_mzv" and not selection_pool:
+            return {
+                "abstain": True,
+                "reason": "%s has no generalized-MZV candidate after robust gates" % axis,
+            }
+        chosen = select_candidate(selection_pool, PROFILES[profile])
         if chosen.selected is None:
             return {"abstain": True, "reason": "%s: %s" % (axis, chosen.abstention_reason)}
-        damping = 0.1
+        selected_metadata = chosen.selected.metadata
+        if selected_metadata.get("parameterized"):
+            damping = float(
+                selected_metadata.get("design_damping_ratio", measured_design_damping)
+            )
+            damping_source = "measured_modes"
+        else:
+            native_damping = selected_metadata.get("design_damping_ratio")
+            damping = (
+                float(native_damping)
+                if native_damping is not None
+                else snapshot_damping
+            )
+            damping_source = (
+                "active_input_shaper_status"
+                if native_damping is not None
+                else "snapshot_configured"
+            )
         stride = max(1, len(aggregate.frequencies) // 512)
         report["selections"].append(
             {
@@ -375,6 +611,8 @@ def analyze_calibration(
                 "shaper_type": chosen.selected.name,
                 "frequency_hz": chosen.selected.frequency,
                 "damping_ratio": damping,
+                "damping_source": damping_source,
+                "damping_uncertainty_samples": damping_uncertainty_samples,
             }
         )
         report["axes"][axis] = {
@@ -384,6 +622,23 @@ def analyze_calibration(
             "native_candidates": _native_candidate_summary(captures[axis]),
             "pareto": [item.name for item in chosen.frontier],
             "selected": chosen.selected.name,
+            "design_damping_ratio": damping,
+            "measured_design_damping_ratio": (
+                measured_design_damping if measured_damping else None
+            ),
+            "damping_source": damping_source,
+            "damping_uncertainty_samples": damping_uncertainty_samples,
+            "generalized_mzv": generalized_report,
+            "acceleration_limits": {
+                "theoretical_smoothing_mm_s2": float(chosen.selected.max_accel),
+                "resonance_validated_mm_s2": None,
+                "print_validated_mm_s2": None,
+                "evidence_level": "theoretical",
+                "note": (
+                    "The smoothing model is not proof of mechanically or print-safe "
+                    "acceleration."
+                ),
+            },
             "native_spectrum": _native_spectrum_summary(captures[axis]),
             "spectrogram": _spectrogram(captures[axis][0], axis),
             "spectrum": {
@@ -391,6 +646,15 @@ def analyze_calibration(
                 "psd": aggregate.values[::stride].tolist(),
                 "relative_mad": mad[::stride].tolist(),
             },
+        }
+    if profile == "adaptive_stock":
+        report["runtime_contract"] = {
+            "interface": "stock_set_input_shaper",
+            "families": ["zv", "mzv", "zvd", "ei", "2hump_ei", "3hump_ei"],
+            "parameterized_family": "mzv",
+            "arbitrary_pulse_vectors": False,
+            "installed_capability_required": True,
+            "held_out_validation_required": True,
         }
     report["native_command_preview"] = "SET_INPUT_SHAPER " + " ".join(
         "SHAPER_TYPE_%s=%s SHAPER_FREQ_%s=%.3f DAMPING_RATIO_%s=%.4f"

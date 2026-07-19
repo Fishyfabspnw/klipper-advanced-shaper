@@ -1,16 +1,28 @@
-"""Research-only generalized-MZV optimization and acceleration envelopes.
+"""Generalized-MZV optimization and evidence-bounded acceleration envelopes.
 
 This module deliberately has no Klippy imports and cannot apply a shaper.  It
-searches a public Klipper shaper parameterization, then emits evidence that a
-separate runtime compatibility gate may consume in a future release.
+searches a public Klipper shaper parameterization, then emits evidence that the
+normal pipeline may promote only after runtime compatibility and held-out
+validation gates pass.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
+
+from klipper_advanced_shaper.shapers import parse_shaper_identifier
+
+_NATIVE_PULSE_COUNTS = {
+    "zv": 2,
+    "mzv": 3,
+    "zvd": 3,
+    "ei": 3,
+    "2hump_ei": 4,
+    "3hump_ei": 5,
+}
 
 
 @dataclass(frozen=True)
@@ -24,6 +36,7 @@ class GeneralizedMZVCandidate:
     pulse_times_s: tuple[float, ...]
     residual_energy_q95: float
     residual_energy_median: float
+    klipper_remaining_vibration: float
     sensitivity: float
     path_error_at_5000: float
     smoothing_max_accel: float
@@ -185,6 +198,37 @@ def _integral(values: np.ndarray, coordinates: np.ndarray) -> float:
     return float(np.sum(0.5 * (values[:-1] + values[1:]) * np.diff(coordinates)))
 
 
+def klipper_remaining_vibration(
+    amplitudes: Sequence[float],
+    pulse_times_s: Sequence[float],
+    frequencies_hz: Sequence[float],
+    psd: Sequence[float],
+    test_damping_ratios: Sequence[float] = (0.075, 0.10, 0.15),
+) -> float:
+    """Reproduce Klipper's thresholded worst-damping vibration fraction."""
+    frequencies = np.asarray(frequencies_hz, dtype=float)
+    power = np.asarray(psd, dtype=float)
+    if frequencies.shape != power.shape or frequencies.ndim != 1:
+        raise ValueError("frequency and PSD vectors must match")
+    if power.size < 2 or np.any(power < 0.0) or not np.all(np.isfinite(power)):
+        raise ValueError("PSD must be finite, non-negative, and non-empty")
+    responses = np.vstack(
+        [
+            oscillator_response(
+                amplitudes, pulse_times_s, frequencies, float(damping_ratio)
+            )
+            for damping_ratio in test_damping_ratios
+        ]
+    )
+    worst_response = np.max(responses, axis=0)
+    threshold = float(np.max(power)) / 20.0
+    denominator = float(np.sum(np.maximum(power - threshold, 0.0)))
+    if denominator <= 0.0:
+        raise ValueError("PSD has no energy above Klipper's vibration threshold")
+    numerator = float(np.sum(np.maximum(worst_response * power - threshold, 0.0)))
+    return numerator / denominator
+
+
 def _pareto(candidates: Sequence[GeneralizedMZVCandidate]) -> list[GeneralizedMZVCandidate]:
     result = []
     for item in candidates:
@@ -212,8 +256,9 @@ def optimize_generalized_mzv(
     square_corner_velocity: float,
     *,
     pulse_counts: Iterable[int] = range(3, 8),
-    spacing_values: Iterable[float] | None = None,
-    frequency_values: Iterable[float] | None = None,
+    spacing_values: Optional[Iterable[float]] = None,
+    frequency_values: Optional[Iterable[float]] = None,
+    fixed_frequency_hz: Optional[float] = None,
     damping_uncertainty: float = 0.02,
     maximum_residual_q95: float = 0.10,
 ) -> dict[str, Any]:
@@ -235,7 +280,14 @@ def optimize_generalized_mzv(
     damping = damping_samples(modes, damping_uncertainty)
     design_damping = float(np.median(damping))
     modal_frequencies = [float(mode["frequency"]) for mode in modes]
-    if frequency_values is None:
+    if fixed_frequency_hz is not None:
+        fixed_frequency = float(fixed_frequency_hz)
+        if not np.isfinite(fixed_frequency) or fixed_frequency <= 0.0:
+            raise ValueError("fixed generalized-MZV frequency must be finite and positive")
+        if frequency_values is not None:
+            raise ValueError("fixed_frequency_hz and frequency_values are mutually exclusive")
+        frequency_values = (fixed_frequency,)
+    elif frequency_values is None:
         center = np.asarray(modal_frequencies, dtype=float)
         frequency_values = np.unique(
             np.concatenate(
@@ -265,6 +317,9 @@ def optimize_generalized_mzv(
                     )
                 residual_array = np.asarray(residuals)
                 accel = smoothing_max_accel(amplitudes, times, square_corner_velocity)
+                native_metric = klipper_remaining_vibration(
+                    amplitudes, times, frequencies, power
+                )
                 candidates.append(
                     GeneralizedMZVCandidate(
                         shaper_type="mzv(n=%d,t=%.6f)" % (int(n), float(spacing)),
@@ -276,6 +331,7 @@ def optimize_generalized_mzv(
                         pulse_times_s=tuple(float(value) for value in times),
                         residual_energy_q95=float(np.quantile(residual_array, 0.95)),
                         residual_energy_median=float(np.median(residual_array)),
+                        klipper_remaining_vibration=native_metric,
                         sensitivity=float(np.ptp(residual_array)),
                         path_error_at_5000=path_error_proxy(
                             amplitudes, times, 5000.0, square_corner_velocity
@@ -289,6 +345,12 @@ def optimize_generalized_mzv(
         "status": "research_only",
         "runtime_applicable": False,
         "family": "klipper_generalized_mzv",
+        "frequency_strategy": (
+            "strongest_measured_peak" if fixed_frequency_hz is not None else "modal_search_grid"
+        ),
+        "fixed_frequency_hz": (
+            float(fixed_frequency_hz) if fixed_frequency_hz is not None else None
+        ),
         "measured_damping_samples": damping.tolist(),
         "evaluated_count": len(candidates),
         "eligible_count": len(eligible),
@@ -302,9 +364,9 @@ def acceleration_envelope(
     *,
     repeatability_cv_q95: float,
     model_sensitivity_q95: float,
-    vibration_confidence_bound: float | None = None,
-    hardware_validated_bound: float | None = None,
-    print_validated_bound: float | None = None,
+    vibration_confidence_bound: Optional[float] = None,
+    hardware_validated_bound: Optional[float] = None,
+    print_validated_bound: Optional[float] = None,
 ) -> AccelerationEnvelope:
     """Return a non-inflating minimum-of-evidence acceleration envelope.
 
@@ -343,13 +405,31 @@ def acceleration_envelope(
     return AccelerationEnvelope(values[limiting], level, values, limiting, notes)
 
 
-def prove_runtime_generalized_mzv(shaper_defs_module: Any) -> dict[str, Any]:
-    """Prove that a running Klipper module parses and realizes the syntax."""
-    syntax = "mzv(n=4,t=0.800000)"
+def prove_runtime_generalized_mzv(
+    shaper_defs_module: Any,
+    syntax: str = "mzv(n=4,t=0.800000)",
+    frequency: float = 60.0,
+    damping_ratio: float = 0.08,
+) -> dict[str, Any]:
+    """Prove that installed Klipper realizes an exact allowlisted MZV form."""
     try:
-        config = shaper_defs_module.get_shaper_cfg(syntax)
-        pulses = shaper_defs_module.init_shaper(syntax, 60.0, 0.08)
+        identifier = parse_shaper_identifier(syntax, allow_parameterized=True)
+        if not identifier.parameterized or identifier.family != "mzv":
+            raise ValueError("runtime generalized-MZV proof requires parameterized MZV")
+        canonical = identifier.canonical
+        config = shaper_defs_module.get_shaper_cfg(canonical)
+        pulses = shaper_defs_module.init_shaper(canonical, frequency, damping_ratio)
         amplitudes, times = pulses
+        expected_amplitudes, expected_times = generalized_mzv_pulses(
+            int(identifier.argument_map()["n"]),
+            identifier.mzv_spacing(),
+            frequency,
+            damping_ratio,
+        )
+        runtime_amplitudes = np.asarray(amplitudes, dtype=float)
+        runtime_times = np.asarray(times, dtype=float)
+        if np.sum(runtime_amplitudes) > 0.0:
+            runtime_amplitudes = runtime_amplitudes / np.sum(runtime_amplitudes)
         passed = (
             config is not None
             and 3 <= len(amplitudes) <= 10
@@ -359,12 +439,67 @@ def prove_runtime_generalized_mzv(shaper_defs_module: Any) -> dict[str, Any]:
                 float(times[index]) <= float(times[index + 1])
                 for index in range(len(times) - 1)
             )
+            and np.allclose(runtime_amplitudes, expected_amplitudes, rtol=1e-6, atol=1e-8)
+            and np.allclose(runtime_times, expected_times, rtol=1e-6, atol=1e-9)
         )
         return {
             "passed": bool(passed),
-            "syntax": syntax,
+            "syntax": canonical,
             "pulse_count": len(amplitudes),
             "reason": None if passed else "runtime returned an invalid pulse sequence",
         }
     except Exception as error:  # Klipper raises version-specific config errors.
         return {"passed": False, "syntax": syntax, "reason": str(error)}
+
+
+def prove_runtime_native_shapers(
+    shaper_defs_module: Any,
+    *,
+    families: Sequence[str] = tuple(_NATIVE_PULSE_COUNTS),
+    frequency: float = 60.0,
+    damping_ratio: float = 0.10,
+    executor_pulse_limit: int = 10,
+) -> dict[str, Any]:
+    """Prove that installed Klipper realizes every requested native family."""
+    proofs = []
+    for raw_family in families:
+        family = str(raw_family).lower()
+        try:
+            identifier = parse_shaper_identifier(family, allow_parameterized=False)
+            expected_count = _NATIVE_PULSE_COUNTS[identifier.family]
+            config = shaper_defs_module.get_shaper_cfg(identifier.canonical)
+            amplitudes, times = shaper_defs_module.init_shaper(
+                identifier.canonical, float(frequency), float(damping_ratio)
+            )
+            amplitude_array = np.asarray(amplitudes, dtype=float)
+            time_array = np.asarray(times, dtype=float)
+            passed = (
+                config is not None
+                and len(amplitudes) == expected_count
+                and len(amplitudes) == len(times)
+                and len(amplitudes) <= int(executor_pulse_limit)
+                and np.all(np.isfinite(amplitude_array))
+                and np.all(amplitude_array >= -1e-5)
+                and float(np.sum(amplitude_array)) > 0.0
+                and np.all(np.isfinite(time_array))
+                and np.all(np.diff(time_array) >= 0.0)
+            )
+            proofs.append(
+                {
+                    "passed": bool(passed),
+                    "syntax": identifier.canonical,
+                    "pulse_count": len(amplitudes),
+                    "reason": None
+                    if passed
+                    else "runtime returned an invalid native pulse sequence",
+                }
+            )
+        except Exception as error:  # Klipper raises version-specific config errors.
+            proofs.append({"passed": False, "syntax": family, "reason": str(error)})
+    failed = next((proof for proof in proofs if not proof["passed"]), None)
+    return {
+        "passed": failed is None,
+        "family": "stock_native_allowlist",
+        "proofs": proofs,
+        "reason": None if failed is None else failed["reason"],
+    }

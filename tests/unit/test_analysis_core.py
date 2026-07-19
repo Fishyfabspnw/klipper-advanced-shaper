@@ -118,11 +118,13 @@ def test_selection_abstains_when_safety_gate_fails():
     assert result.abstention_reason
 
 
-def test_held_out_attenuation_bootstrap_requires_three_repeats():
+def test_held_out_attenuation_bootstrap_supports_lower_confidence_two_repeats():
     low, high = attenuation_improvement_ci(
         np.array([10, 11, 9, 10]), np.array([7, 7.7, 6.3, 7]), seed=1
     )
     assert low == pytest.approx(0.3)
     assert high == pytest.approx(0.3)
+    low, high = attenuation_improvement_ci(np.array([10, 12]), np.array([8, 9]))
+    assert low <= high
     with pytest.raises(ValueError):
-        attenuation_improvement_ci(np.ones(2), np.ones(2))
+        attenuation_improvement_ci(np.ones(1), np.ones(1))

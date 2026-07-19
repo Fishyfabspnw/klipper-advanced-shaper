@@ -40,6 +40,36 @@ def test_installation_guide_covers_full_lifecycle():
         assert expected in guide
 
 
+def test_installer_force_replaces_same_version_package_without_dependency_churn():
+    installer = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    normal_install = 'pip install --upgrade "${repo_dir}"'
+    forced_install = '--force-reinstall --no-deps "${repo_dir}"'
+
+    assert normal_install in installer
+    assert forced_install in installer
+    assert installer.index(normal_install) < installer.index(forced_install)
+    force_lines = [line for line in installer.splitlines() if "--force-reinstall" in line]
+    assert force_lines == ['  --force-reinstall --no-deps "${repo_dir}"']
+
+
+def test_readme_documents_sweep_timing_and_smoke_test_boundaries():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    normalized = " ".join(readme.split())
+
+    assert "nine full resonance sweeps per axis" in normalized
+    assert "ACCEL_PER_HZ` changes excitation intensity, not sweep duration" in normalized
+    assert "REPEATS=1 VALIDATE=0" in normalized
+    assert "full-confidence default requires `REPEATS>=3`" in normalized
+    assert "approximately 6.5 minutes per axis at 2 Hz/s" in normalized
+    assert "excludes movement between probe points" in normalized
+    assert "attempt `9a822d6fdc4b` completed all 18 sweeps" in normalized
+    assert "unsigned decimal from 20 through 150" in normalized
+    assert "does not require Klipper's optional `[respond]` section" in normalized
+    assert "fit within 80% of the printer's current" in normalized
+    assert "does not guarantee a PSD above `1e-5`" in normalized
+    assert "performs 18 total sweeps" in normalized
+
+
 def test_private_artifact_patterns_are_ignored():
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "*.stdata" in ignore

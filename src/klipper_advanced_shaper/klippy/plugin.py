@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -13,9 +14,32 @@ from .adapter import (
     ShaperSelection,
     selection_from_mapping,
 )
+from .excitation import parse_accel_per_hz, parse_hz_per_sec
 from .state import CalibrationCancelled, CalibrationState, StateMachine
 
-SUPPORTED_PROFILES = {"quality", "balanced", "performance"}
+SUPPORTED_PROFILES = {
+    "quality",
+    "balanced",
+    "performance",
+    "experimental_mzv",
+    "adaptive_stock",
+}
+
+
+def _parse_fast_validation(value: Any) -> bool:
+    if value in (None, False, 0, "0"):
+        return False
+    if value in (True, 1, "1"):
+        return True
+    raise ValueError("FAST_VALIDATION must be numeric 0 or 1")
+
+
+def _parse_peak_lock(value: Any) -> bool:
+    if value in (None, False, 0, "0"):
+        return False
+    if value in (True, 1, "1"):
+        return True
+    raise ValueError("PEAK_LOCK must be numeric 0 or 1")
 
 
 def _analysis_unavailable(**_: Any) -> Mapping[str, Any]:
@@ -41,6 +65,7 @@ class AdvancedInputShaper:
         analyzer: Optional[Callable[..., Mapping[str, Any]]] = None,
         id_factory: Optional[Callable[[], str]] = None,
         artifact_writer: Any = None,
+        experimental_enabled: Optional[bool] = None,
     ) -> None:
         if adapter is None:
             if config is None:
@@ -52,13 +77,18 @@ class AdvancedInputShaper:
         self.artifact_writer = artifact_writer
         self.worker = None
         self.minimum_max_accel = {"X": 0.0, "Y": 0.0}
+        self.experimental_enabled = bool(experimental_enabled)
         self.machine = StateMachine()
         self.results: dict[str, CalibrationResult] = {}
         self.current_result_id: Optional[str] = None
         self.current_attempt_id: Optional[str] = None
         self.current_attempt_status: Optional[str] = None
         self.current_attempt_artifacts: Optional[Mapping[str, Any]] = None
+        self.current_validation_protocol: Optional[Mapping[str, Any]] = None
         if config is not None:
+            self.experimental_enabled = config.getboolean(
+                "enable_experimental_generalized_mzv", False
+            )
             self.minimum_max_accel = {
                 "X": config.getfloat("minimum_max_accel_x", 0.0, minval=0.0),
                 "Y": config.getfloat("minimum_max_accel_y", 0.0, minval=0.0),
@@ -116,6 +146,10 @@ class AdvancedInputShaper:
         profile: str = "balanced",
         repeats: int = 3,
         validate: bool = True,
+        accel_per_hz: Any = None,
+        hz_per_sec: Any = None,
+        fast_validation: Any = False,
+        peak_lock: Any = False,
     ) -> CalibrationResult:
         normalized_axes = tuple(dict.fromkeys(axis.upper() for axis in axes))
         if not normalized_axes or any(axis not in {"X", "Y"} for axis in normalized_axes):
@@ -125,12 +159,57 @@ class AdvancedInputShaper:
             raise ValueError("unsupported profile: %s" % profile)
         if not 1 <= repeats <= 20:
             raise ValueError("repeats must be between 1 and 20")
+        selected_accel_per_hz = parse_accel_per_hz(accel_per_hz)
+        selected_hz_per_sec = parse_hz_per_sec(hz_per_sec)
+        fast_validation_enabled = _parse_fast_validation(fast_validation)
+        peak_lock_enabled = _parse_peak_lock(peak_lock)
+        experimental_mode = profile in {"experimental_mzv", "adaptive_stock"}
+        if experimental_mode and not self.experimental_enabled:
+            raise ValueError(
+                "%s requires enable_experimental_generalized_mzv: True" % profile
+            )
+        if fast_validation_enabled and not experimental_mode:
+            raise ValueError("FAST_VALIDATION is only supported for adaptive stock modes")
+        if peak_lock_enabled and not experimental_mode:
+            raise ValueError("PEAK_LOCK is only supported for adaptive stock modes")
+        if experimental_mode and not validate:
+            raise ValueError("%s requires mandatory held-out validation" % profile)
+        if fast_validation_enabled and repeats != 2:
+            raise ValueError("FAST_VALIDATION requires exactly REPEATS=2")
+        if fast_validation_enabled and selected_hz_per_sec != 2.0:
+            raise ValueError("FAST_VALIDATION requires explicit HZ_PER_SEC=2")
+        if experimental_mode and not fast_validation_enabled and repeats < 3:
+            raise ValueError("%s requires at least three repeats" % profile)
 
         attempt_id = self.id_factory()
         self.machine.begin()
         self.current_attempt_id = attempt_id
         self.current_attempt_status = "running"
         self.current_attempt_artifacts = None
+        if fast_validation_enabled:
+            protocol_mode = "fast_lower_confidence_2_repeat"
+        elif experimental_mode:
+            protocol_mode = "full_confidence_default"
+        elif validate:
+            protocol_mode = "native_validation"
+        else:
+            protocol_mode = "native_unvalidated_capture"
+        validation_protocol: dict[str, Any] = {
+            "mode": protocol_mode,
+            "lower_confidence": fast_validation_enabled or (validate and repeats < 3),
+            "repeats_per_group": repeats,
+            "validation_enabled": bool(validate),
+            "full_sweeps_per_axis": repeats * (3 if validate else 1),
+            "motion_time_excludes_host_analysis_and_artifact_time": True,
+        }
+        if peak_lock_enabled:
+            validation_protocol.update(
+                {
+                    "peak_lock": True,
+                    "frequency_strategy": "strongest_measured_peak",
+                }
+            )
+        self.current_validation_protocol = validation_protocol
         # A previous accepted result remains addressable in ``results``, but it
         # must not appear to be the outcome of this new attempt.
         self.current_result_id = None
@@ -141,15 +220,62 @@ class AdvancedInputShaper:
         rejection_report: Optional[Mapping[str, Any]] = None
         rejection_raw_groups: Optional[Mapping[str, Mapping[str, list[Any]]]] = None
         captures: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
+        runtime_capability: Optional[Mapping[str, Any]] = None
+        excitation_preflight: Optional[Mapping[str, Any]] = None
+        executor_pulse_limit = 10
         try:
             self.adapter.preflight(normalized_axes)
+            excitation_probe = getattr(self.adapter, "preflight_excitation", None)
+            if excitation_probe is None:
+                raise RuntimeError("adapter cannot prove resonance excitation motion budget")
+            excitation_preflight = excitation_probe(
+                normalized_axes, selected_accel_per_hz, selected_hz_per_sec
+            )
+            sweep_span = float(excitation_preflight["max_frequency_hz"]) - float(
+                excitation_preflight["min_frequency_hz"]
+            )
+            sweep_rate = float(excitation_preflight["hz_per_sec"])
+            validation_protocol["estimated_motion_seconds_per_axis"] = (
+                validation_protocol["full_sweeps_per_axis"] * sweep_span / sweep_rate
+            )
+            validation_protocol["hz_per_sec"] = sweep_rate
+            self.current_validation_protocol = dict(validation_protocol)
+            if experimental_mode:
+                capability_probe = getattr(self.adapter, "preflight_experimental", None)
+                if capability_probe is None:
+                    raise RuntimeError("adapter cannot prove generalized-MZV runtime support")
+                runtime_capability = capability_probe()
+                executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             self.machine.checkpoint()
             snapshot = self.adapter.snapshot()
+            snapshot_selections = tuple(
+                ShaperSelection(
+                    getattr(snapshot, "shaper_type_" + axis.lower()),
+                    getattr(snapshot, "shaper_freq_" + axis.lower()),
+                    axis,
+                    getattr(snapshot, "damping_ratio_" + axis.lower()),
+                )
+                for axis in normalized_axes
+            )
+            if any(item.parameterized for item in snapshot_selections):
+                capability_probe = getattr(self.adapter, "preflight_experimental", None)
+                if capability_probe is None:
+                    raise RuntimeError("adapter cannot prove existing parameterized shaper support")
+                runtime_capability = capability_probe(snapshot_selections)
+                executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
             self.machine.transition(CalibrationState.BASELINE_CAPTURE)
             for axis in normalized_axes:
                 for repeat in range(repeats):
                     self.machine.checkpoint()
-                    captures[axis].append(self.adapter.capture(axis, repeat, False))
+                    captures[axis].append(
+                        self.adapter.capture(
+                            axis,
+                            repeat,
+                            False,
+                            accel_per_hz=selected_accel_per_hz,
+                            hz_per_sec=selected_hz_per_sec,
+                        )
+                    )
 
             self.machine.transition(CalibrationState.ANALYSIS)
             self.machine.checkpoint()
@@ -159,6 +285,9 @@ class AdvancedInputShaper:
                 axes=normalized_axes,
                 profile=profile,
                 snapshot=snapshot,
+                experimental_mode=experimental_mode,
+                executor_pulse_limit=executor_pulse_limit,
+                peak_lock=peak_lock_enabled,
             )
             if report.get("abstain"):
                 raise RuntimeError("analysis abstained: %s" % report.get("reason", "quality gate"))
@@ -182,6 +311,23 @@ class AdvancedInputShaper:
             selected_axes = {item.axis for item in selections}
             if selected_axes != set(normalized_axes) or len(selections) != len(normalized_axes):
                 raise RuntimeError("analysis did not return exactly one selection per axis")
+            has_parameterized = any(item.parameterized for item in selections)
+            if has_parameterized and not experimental_mode:
+                raise RuntimeError(
+                    "analysis returned a parameterized shaper outside experimental mode"
+                )
+            if has_parameterized and not validate:
+                raise RuntimeError("parameterized shapers require held-out validation")
+            if has_parameterized:
+                capability_probe = getattr(self.adapter, "preflight_experimental", None)
+                if capability_probe is None:
+                    raise RuntimeError("adapter cannot prove exact parameterized selection")
+                runtime_capability = capability_probe(selections)
+                executor_pulse_limit = int(runtime_capability["executor_pulse_limit"])
+            report = dict(report)
+            report["runtime_capability"] = runtime_capability
+            report["excitation_preflight"] = excitation_preflight
+            report["validation_protocol"] = dict(validation_protocol)
 
             if validate:
                 self.machine.transition(CalibrationState.TEMPORARY_VALIDATION)
@@ -199,13 +345,29 @@ class AdvancedInputShaper:
                 for axis in normalized_axes:
                     for repeat in range(repeats):
                         self.machine.checkpoint()
-                        held_out[axis].append(self.adapter.capture(axis, repeat, validation=True))
+                        held_out[axis].append(
+                            self.adapter.capture(
+                                axis,
+                                repeat,
+                                validation=True,
+                                accel_per_hz=selected_accel_per_hz,
+                                hz_per_sec=selected_hz_per_sec,
+                            )
+                        )
                 self.adapter.apply_temporary(selections)
                 validation: dict[str, list[Any]] = {axis: [] for axis in normalized_axes}
                 for axis in normalized_axes:
                     for repeat in range(repeats):
                         self.machine.checkpoint()
-                        validation[axis].append(self.adapter.capture(axis, repeat, validation=True))
+                        validation[axis].append(
+                            self.adapter.capture(
+                                axis,
+                                repeat,
+                                validation=True,
+                                accel_per_hz=selected_accel_per_hz,
+                                hz_per_sec=selected_hz_per_sec,
+                            )
+                        )
                 validation_report = self._invoke(
                     self.analyzer,
                     captures=captures,
@@ -215,19 +377,27 @@ class AdvancedInputShaper:
                     profile=profile,
                     snapshot=snapshot,
                     prior_report=report,
+                    experimental_mode=experimental_mode,
+                    executor_pulse_limit=executor_pulse_limit,
+                    peak_lock=peak_lock_enabled,
                 )
                 report = dict(report)
-                report["reference"] = [
-                    {
-                        "axis": item.axis,
-                        "shaper_type": item.shaper_type,
-                        "frequency_hz": item.frequency,
-                        "damping_ratio": item.damping_ratio,
-                    }
-                    for item in reference
-                ]
+                report["reference"] = [item.to_mapping() for item in reference]
                 report["validation"] = validation_report.get("validation", {})
                 report["validation_report"] = dict(validation_report)
+                if experimental_mode:
+                    try:
+                        self._validate_generalized_evidence(
+                            report["validation"], normalized_axes
+                        )
+                    except RuntimeError as evidence_error:
+                        invalid_validation = dict(report["validation"])
+                        invalid_validation["passed"] = False
+                        invalid_validation["reason"] = str(evidence_error)
+                        report["validation"] = invalid_validation
+                        validation_report = dict(validation_report)
+                        validation_report["validation"] = invalid_validation
+                        report["validation_report"] = validation_report
                 if not validation_report.get("validation", {}).get("passed", False):
                     rejection_error = RuntimeError(
                         "candidate failed held-out validation: %s"
@@ -334,6 +504,7 @@ class AdvancedInputShaper:
 
     def apply(self, result_id: str) -> CalibrationResult:
         result = self._get_result(result_id)
+        self._assert_runtime_eligible(result)
         if self.machine.state not in {
             CalibrationState.REVIEW,
             CalibrationState.RUNTIME_APPLIED,
@@ -347,6 +518,7 @@ class AdvancedInputShaper:
 
     def stage(self, result_id: str) -> CalibrationResult:
         result = self._get_result(result_id)
+        self._assert_runtime_eligible(result)
         if self.machine.state not in {
             CalibrationState.REVIEW,
             CalibrationState.RUNTIME_APPLIED,
@@ -370,13 +542,70 @@ class AdvancedInputShaper:
             "artifacts": self.current_attempt_artifacts,
             "cancel_requested": self.machine.cancel_requested,
             "error": self.machine.error,
+            "experimental_generalized_mzv_enabled": self.experimental_enabled,
+            "validation_protocol": self.current_validation_protocol,
         }
+
+    def get_status(self, _eventtime: Any = None) -> Mapping[str, Any]:
+        """Expose review state to Klipper templates and Moonraker."""
+        return self.status()
 
     def _get_result(self, result_id: str) -> CalibrationResult:
         try:
             return self.results[result_id]
         except KeyError as error:
             raise ValueError("unknown result: %s" % result_id) from error
+
+    @staticmethod
+    def _assert_runtime_eligible(result: CalibrationResult) -> None:
+        if result.report.get("status") != "accepted":
+            raise RuntimeError("only accepted results are runtime eligible")
+        if any(item.parameterized for item in result.selections):
+            validation = result.report.get("validation", {})
+            capability = result.report.get("runtime_capability", {})
+            if not isinstance(validation, Mapping) or not validation.get("passed"):
+                raise RuntimeError("parameterized result lacks accepted held-out validation")
+            if not isinstance(capability, Mapping) or not capability.get("passed"):
+                raise RuntimeError("parameterized result lacks installed-Klipper capability proof")
+        if result.report.get("profile") == "adaptive_stock":
+            validation = result.report.get("validation", {})
+            capability = result.report.get("runtime_capability", {})
+            if not isinstance(validation, Mapping) or not validation.get("passed"):
+                raise RuntimeError("adaptive-stock result lacks accepted held-out validation")
+            if not isinstance(capability, Mapping) or not capability.get("passed"):
+                raise RuntimeError(
+                    "adaptive-stock result lacks installed-Klipper capability proof"
+                )
+
+    @staticmethod
+    def _validate_generalized_evidence(
+        validation: Any, axes: Sequence[str]
+    ) -> None:
+        if not isinstance(validation, Mapping) or not validation.get("passed"):
+            return
+        details = validation.get("axes")
+        if not isinstance(details, Mapping) or set(details) != set(axes):
+            raise RuntimeError("generalized validation is missing exact per-axis evidence")
+        for axis in axes:
+            values = details[axis]
+            if not isinstance(values, Mapping) or values.get("qc_passed") is not True:
+                raise RuntimeError("%s generalized validation did not pass QC" % axis)
+            confidence = values.get("improvement_ci_95")
+            if not isinstance(confidence, (list, tuple)) or len(confidence) != 2:
+                raise RuntimeError("%s generalized attenuation confidence is insufficient" % axis)
+            try:
+                confidence_low = float(confidence[0])
+                cross_axis_regression = float(values["cross_axis_regression"])
+            except (KeyError, TypeError, ValueError):
+                raise RuntimeError(
+                    "%s generalized validation contains malformed evidence" % axis
+                ) from None
+            if not math.isfinite(confidence_low) or confidence_low < 0.10:
+                raise RuntimeError("%s generalized attenuation confidence is insufficient" % axis)
+            if not math.isfinite(cross_axis_regression) or cross_axis_regression > 0.05:
+                raise RuntimeError("%s generalized cross-axis regression is unsafe" % axis)
+            if values.get("passed") is not True:
+                raise RuntimeError("%s generalized validation gate was not accepted" % axis)
 
     def cmd_ADV_SHAPER_CALIBRATE(self, gcmd: Any) -> None:
         axis = gcmd.get("AXIS", "ALL").upper()
@@ -387,6 +616,12 @@ class AdvancedInputShaper:
                 profile=gcmd.get("PROFILE", "balanced"),
                 repeats=gcmd.get_int("REPEATS", 3, minval=1, maxval=20),
                 validate=bool(gcmd.get_int("VALIDATE", 1, minval=0, maxval=1)),
+                accel_per_hz=gcmd.get("ACCEL_PER_HZ", None),
+                hz_per_sec=gcmd.get("HZ_PER_SEC", None),
+                fast_validation=gcmd.get_int(
+                    "FAST_VALIDATION", 0, minval=0, maxval=1
+                ),
+                peak_lock=gcmd.get_int("PEAK_LOCK", 0, minval=0, maxval=1),
             )
         except Exception as error:
             raise gcmd.error(str(error))
