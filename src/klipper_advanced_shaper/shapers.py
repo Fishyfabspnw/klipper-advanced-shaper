@@ -12,7 +12,8 @@ import re
 from dataclasses import dataclass
 from typing import Mapping, Union
 
-NATIVE_SHAPERS = frozenset({"zv", "mzv", "zvd", "ei", "2hump_ei", "3hump_ei"})
+NATIVE_SHAPER_ORDER = ("zv", "mzv", "zvd", "ei", "2hump_ei", "3hump_ei")
+NATIVE_SHAPERS = frozenset(NATIVE_SHAPER_ORDER)
 MAX_EXECUTOR_PULSES = 10
 
 PARAMETERIZED_ARGUMENTS: Mapping[str, frozenset[str]] = {

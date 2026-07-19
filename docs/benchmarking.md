@@ -36,5 +36,9 @@ An advanced candidate passes only if all of the following hold:
   printer state without errors.
 
 Report theoretical shaping acceleration separately from acceleration actually
-validated on hardware. A configured global maximum is not evidence that the
-mechanics can safely sustain it.
+validated at a recorded resonance-test acceleration and from acceleration
+validated by a supervised print. A configured global maximum, smoothing model,
+or normalized attenuation fraction is not evidence that the mechanics can
+safely sustain an acceleration. The calibration does not change
+`[printer] max_accel`; acceleration changes require a separate operator decision and
+separate printer/print validation.

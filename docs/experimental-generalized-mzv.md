@@ -12,6 +12,12 @@ This is best described as **generalized MZV optimization**, not a new Klipper
 shaper family. The plugin does not patch, replace, or monkey-patch Klipper's
 `shaper_defs`, `input_shaper`, or C kinematics code.
 
+“Stock compatible” means a current unmodified Klipper checkout whose installed
+`shaper_defs` parser and generic executor pass the capability probe. It does not
+mean every historical or vendor fork is assumed compatible. An unsupported
+build abstains before experimental motion and never silently substitutes plain
+MZV.
+
 Pulse-generation parity is frozen against upstream Klipper commit
 `7046bd00ef5c30dec6febc724f8d22967433c45c`. The runtime capability probe is
 mandatory because older or vendor-modified Klipper builds may not accept

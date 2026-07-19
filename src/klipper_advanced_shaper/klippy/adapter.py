@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
-from klipper_advanced_shaper.shapers import NATIVE_SHAPERS, parse_shaper_identifier
+from klipper_advanced_shaper.shapers import NATIVE_SHAPER_ORDER, parse_shaper_identifier
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,13 @@ class KlipperPrinterAdapter:
         self.capture_provider = self.printer.lookup_object("advanced_shaper_capture", None)
         self._shaper_defs_module = shaper_defs_module
         self._executor_pulse_limit = executor_pulse_limit
+        self._capture_native_shapers: Optional[Sequence[str]] = None
         self.last_capability: Optional[Mapping[str, Any]] = None
+
+    def configure_capture_profile(self, profile: str) -> None:
+        self._capture_native_shapers = (
+            NATIVE_SHAPER_ORDER if str(profile).lower() == "adaptive_stock" else None
+        )
 
     def _load_shaper_defs(self) -> Any:
         if self._shaper_defs_module is not None:
@@ -174,7 +180,7 @@ class KlipperPrinterAdapter:
         failed = next((item for item in proofs if not item.get("passed")), None)
         native_proof = prove_runtime_native_shapers(
             module,
-            families=tuple(sorted(NATIVE_SHAPERS)),
+            families=NATIVE_SHAPER_ORDER,
             executor_pulse_limit=executor_limit,
         )
         if not native_proof.get("passed"):
@@ -317,6 +323,7 @@ class KlipperPrinterAdapter:
             accel_per_hz=accel_per_hz,
             hz_per_sec=hz_per_sec,
             design_damping_ratio=design_damping_ratio,
+            native_shapers=self._capture_native_shapers,
         )
 
     def _shaping_status(self, eventtime: Optional[float] = None) -> dict[str, Any]:

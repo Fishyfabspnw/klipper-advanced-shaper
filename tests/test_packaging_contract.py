@@ -36,8 +36,40 @@ def test_installation_guide_covers_full_lifecycle():
         "sudo systemctl restart klipper",
         "KLIPPER_DIR",
         "KLIPPER_VENV",
+        "KLIPPER_CONFIG_DIR",
+        "[include advanced_shaper_macros.cfg]",
+        "enable_experimental_generalized_mzv",
+        "ACCEL_PER_HZ",
+        "AdvancedShaper_results/<attempt-id>",
     ):
         assert expected in guide
+
+
+def test_shaketune_style_docs_index_and_macro_reference_are_packaged():
+    index = (ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+    calibration = (ROOT / "docs" / "macros" / "advanced_shaper_calibrate.md").read_text(
+        encoding="utf-8"
+    )
+    workflow = (ROOT / "docs" / "macros" / "result_workflow.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Commands and workflows" in index
+    assert "| parameter | default value | description |" in calibration
+    for parameter in (
+        "`AXIS`",
+        "`PROFILE`",
+        "`REPEATS`",
+        "`VALIDATE`",
+        "`ACCEL_PER_HZ`",
+        "`HZ_PER_SEC`",
+        "`FAST_VALIDATION`",
+        "`PEAK_LOCK`",
+    ):
+        assert parameter in calibration
+    assert "This is not a preset list" in calibration
+    assert "ordinary profiles do not silently add ZVD" in calibration
+    assert "SAVE_CONFIG" in workflow
 
 
 def test_installer_force_replaces_same_version_package_without_dependency_churn():
@@ -60,14 +92,43 @@ def test_readme_documents_sweep_timing_and_smoke_test_boundaries():
     assert "ACCEL_PER_HZ` changes excitation intensity, not sweep duration" in normalized
     assert "REPEATS=1 VALIDATE=0" in normalized
     assert "full-confidence default requires `REPEATS>=3`" in normalized
-    assert "approximately 6.5 minutes per axis at 2 Hz/s" in normalized
-    assert "excludes movement between probe points" in normalized
+    assert "approximately 6.5 minutes of resonance motion per axis at 2 Hz/s" in normalized
+    assert "movement between probe points" in normalized
+    assert "not a promise that the complete axis workflow finishes" in normalized
     assert "attempt `9a822d6fdc4b` completed all 18 sweeps" in normalized
     assert "unsigned decimal from 20 through 150" in normalized
     assert "does not require Klipper's optional `[respond]` section" in normalized
     assert "fit within 80% of the printer's current" in normalized
     assert "does not guarantee a PSD above `1e-5`" in normalized
     assert "performs 18 total sweeps" in normalized
+    assert "free numeric excitation control" in normalized.lower()
+    assert "standard macro UI cannot attach a separate tooltip to each input" in normalized
+    assert "modify Klipper's motion planner" in normalized
+    assert "It does **not** modify" in normalized
+    assert "installation alone does not create it" in normalized
+
+
+def test_readme_has_complete_calibration_parameter_reference():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for parameter in (
+        "`AXIS`",
+        "`PROFILE`",
+        "`REPEATS`",
+        "`VALIDATE`",
+        "`ACCEL_PER_HZ`",
+        "`HZ_PER_SEC`",
+        "`FAST_VALIDATION`",
+        "`PEAK_LOCK`",
+    ):
+        assert parameter in readme
+    for profile in (
+        "quality",
+        "balanced",
+        "performance",
+        "experimental_mzv",
+        "adaptive_stock",
+    ):
+        assert profile in readme
 
 
 def test_private_artifact_patterns_are_ignored():

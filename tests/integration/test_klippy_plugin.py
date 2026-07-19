@@ -30,6 +30,9 @@ class FakeAdapter:
     controller: object = None
     fail_restore: bool = False
 
+    def configure_capture_profile(self, profile):
+        self.capture_profile = profile
+
     def preflight(self, axes):
         self.calls.append(("preflight", tuple(axes)))
 
@@ -682,6 +685,7 @@ def test_adaptive_stock_native_winner_keeps_capability_and_validation_gates():
         ("X",), profile="adaptive_stock", repeats=3, validate=True
     )
 
+    assert adapter.capture_profile == "adaptive_stock"
     assert adapter.calls.index(("capability", ())) < next(
         index for index, call in enumerate(adapter.calls) if call[0] == "capture"
     )

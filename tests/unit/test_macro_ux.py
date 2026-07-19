@@ -147,6 +147,17 @@ def test_direct_numeric_calibration_is_the_only_mainsail_visible_macro():
     assert "params.PEAK_LOCK|default(0)" in macros
     assert "PEAK_LOCK={peak_lock}" in macros
     assert "REPEATS=2 VALIDATE=1 HZ_PER_SEC=2" in macros
+    for explanation in (
+        "AXIS chooses X, Y, or ALL",
+        "PROFILE chooses the selection tradeoff",
+        "REPEATS controls statistical confidence",
+        "VALIDATE enables held-out comparison",
+        "ACCEL_PER_HZ sets excitation intensity",
+        "HZ_PER_SEC sets sweep speed",
+        "FAST_VALIDATION=1 selects the shorter lower-confidence protocol",
+        "PEAK_LOCK=1 fixes generalized MZV frequency",
+    ):
+        assert explanation in macros
     assert "action:prompt_" not in macros
     assert "[respond]" not in macros
 

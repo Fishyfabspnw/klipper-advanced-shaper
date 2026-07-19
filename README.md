@@ -4,8 +4,9 @@ Klipper Advanced Shaper is an experimental, fail-closed calibration and analysis
 plugin for [Klipper](https://www.klipper3d.org/). It aims to find better measured
 trade-offs between residual vibration, smoothing, repeatability, and usable
 acceleration while continuing to use Klipper's native input-shaper execution.
-It does **not** replace or modify Klipper's motion planner, kinematics, or MCU
-code.
+It does **not** modify Klipper's motion planner, `shaper_defs.py`,
+`input_shaper.py`, `shaper_calibrate.py`, C kinematics helper, or MCU firmware.
+Runtime selections are sent through stock Klipper's `SET_INPUT_SHAPER` command.
 
 > **Alpha safety notice:** `0.1.0a1` has not been validated across printer
 > architectures and must not be treated as proof that a printer can safely run
@@ -31,6 +32,10 @@ after the installed Klipper proves exact support and mandatory held-out
 validation passes. The standalone optimizer remains research-only, and neither
 path changes printer acceleration.
 See [experimental generalized MZV](docs/experimental-generalized-mzv.md).
+
+For a Shake&Tune-style command index, per-macro usage page, and
+parameter/default/description tables, start with the
+[Advanced Shaper documentation](docs/README.md).
 
 The `adaptive_stock` profile compares native Klipper ZV, MZV, ZVD, EI,
 2HUMP_EI, and 3HUMP_EI candidates with the same capability-proven generalized
@@ -80,9 +85,11 @@ Klipper's G-code `RESTART` command is not enough after installing Python code.
 Confirm that `ADV_SHAPER_STATUS` is recognized before attempting a calibration.
 
 The installer does not restart Klipper or edit `printer.cfg`. It installs the
-package into `~/klippy-env` and a small loader into `~/klipper/klippy/extras`.
-Custom Klipper locations, updating, uninstalling, verification, and
-troubleshooting are covered in the
+package into `~/klippy-env`, adds the small `advanced_input_shaper.py` loader to
+`~/klipper/klippy/extras`, and copies `advanced_shaper_macros.cfg` to
+`~/printer_data/config`. It does not replace any stock Klipper module. Custom
+Klipper locations, updating, uninstalling, verification, and troubleshooting
+are covered in the
 **[complete installation guide](docs/installation.md)**.
 
 Before calibration, the analysis interpreter boundary can be checked without
@@ -107,6 +114,22 @@ ADV_SHAPER_APPLY RESULT=<id>
 ADV_SHAPER_STAGE RESULT=<id>
 ```
 
+### Calibration parameters
+
+The low-level command and the supplied Mainsail macro accept the same
+calibration parameters:
+
+| Parameter | Accepted values | Default | Meaning and restrictions |
+| --- | --- | --- | --- |
+| `AXIS` | `X`, `Y`, or `ALL` | `ALL` | Calibrates one axis or X followed by Y. Every requested axis must be homed. |
+| `PROFILE` | `quality`, `balanced`, `performance`, `experimental_mzv`, or `adaptive_stock` | `balanced` | The first three retain the ordinary native analysis path. `experimental_mzv` searches only generalized MZV. `adaptive_stock` compares all six native families with generalized MZV. The last two require the explicit config opt-in and mandatory held-out validation. |
+| `REPEATS` | Integer `1` through `20` | `3` | Sweeps per training/reference/candidate group. Experimental profiles require at least three, except the exact two-repeat fast protocol. |
+| `VALIDATE` | `0` or `1` | `1` | Runs independent reference and candidate sweeps when `1`. It is mandatory for both experimental profiles. A `0` run is not physical performance evidence. |
+| `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal from `20` through `150` | `CONFIG` | Free numeric excitation control in mm/s^2/Hz—not presets. `CONFIG` inherits `[resonance_tester]`. The resolved value must pass the dynamic motion-budget check. |
+| `HZ_PER_SEC` | `CONFIG` or any unsigned decimal from `0.1` through `2` | `CONFIG` | Sweep rate in Hz/s. It changes commanded sweep time, not excitation intensity. |
+| `FAST_VALIDATION` | `0` or `1` | `0` | Lower-confidence mode for the two experimental profiles only. `1` requires exactly `REPEATS=2`, `VALIDATE=1`, and explicit `HZ_PER_SEC=2`. |
+| `PEAK_LOCK` | `0` or `1` | `0` | Experimental profiles only. `1` fixes generalized-MZV frequency to the strongest measured PSD mode for that axis; it does not weaken any validation gate. |
+
 Run calibration only while the printer is idle, clear of obstructions, and
 homed on every requested axis. Start with one axis and the conservative default
 profile:
@@ -115,15 +138,22 @@ profile:
 ADV_SHAPER_CALIBRATE AXIS=X PROFILE=balanced REPEATS=3 VALIDATE=1
 ```
 
-`ADV_SHAPER_UI_CALIBRATE` is the only macro shown in Mainsail's macro panel. It
-is an ordinary parameterized macro so an operator can enter a numeric
-`ACCEL_PER_HZ`; Mainsail's official Macro Prompt protocol provides buttons but
-no free-text input control, so this workflow deliberately does not fake a
-dropdown. The supplied macro does not use that prompt protocol and therefore
-does not require Klipper's optional `[respond]` section. Supporting wrappers use
-a leading underscore and remain hidden.
+`ADV_SHAPER_UI_CALIBRATE` is the only macro shown in Mainsail's macro panel.
+Enter `ACCEL_PER_HZ` as any number from 20 through 150, or enter `CONFIG`; the
+macro deliberately does not force a list of presets. Mainsail's standard macro
+UI cannot attach a separate tooltip to each input. The macro description, its
+start message, and the table above provide the parameter explanations. The
+supplied macro does not use Macro Prompt and does not require Klipper's optional
+`[respond]` section. Supporting wrappers use a leading underscore and remain
+hidden.
 Klippy's low-level `ADV_SHAPER_STATUS`, `ADV_SHAPER_CANCEL`,
 `ADV_SHAPER_APPLY`, and `ADV_SHAPER_STAGE` commands remain directly callable.
+
+The same free numeric control is available from the console, for example:
+
+```text
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=150 HZ_PER_SEC=2 FAST_VALIDATION=1
+```
 
 `ACCEL_PER_HZ` accepts `CONFIG` or an unsigned decimal from 20 through 150
 mm/s^2/Hz inclusive. `CONFIG` inherits `[resonance_tester]` without overriding
@@ -152,26 +182,29 @@ it does not directly set the graph scale and does not guarantee a PSD above
 or hardware damage. A numeric value of 150 is accepted only when the dynamic
 motion-budget preflight also passes.
 
-The UI apply and stage actions default to the current accepted result ID. They
-fail if no accepted result is ready. A rejected or failed attempt clears that
-default, even if an older accepted result remains in process memory.
+The hidden UI apply and stage wrappers default to the current accepted result
+ID. The low-level commands remain explicit. Both fail if no accepted result is
+ready. A rejected or failed attempt clears that default, even if an older
+accepted result remains in process memory.
 
 The Python controller independently enforces the mandatory validation and
-repeat count for `experimental_mzv` and `adaptive_stock`; macro parameters cannot weaken them. The
-calibration macro never invokes apply, stage, or `SAVE_CONFIG`.
+repeat count for `experimental_mzv` and `adaptive_stock`; macro parameters
+cannot weaken them. The calibration macro never invokes apply, stage, or
+`SAVE_CONFIG`.
 
-`PEAK_LOCK=1` is available only to `experimental_mzv` and `adaptive_stock`. It fixes every
-generalized-MZV design considered for an axis to that axis's strongest measured
-PSD mode (the detected mode with the highest PSD amplitude), while still
-optimizing the strict allowlisted `n` and `t` parameters. The exact target
-frequency and strategy are recorded in the report. It does not skip capability
-preflight, held-out reference/candidate sweeps, exact status readback, QC,
-confidence, cross-axis regression, or rollback.
+`PEAK_LOCK=1` is available only to `experimental_mzv` and `adaptive_stock`. It
+fixes every generalized-MZV design considered for an axis to that axis's
+strongest measured PSD mode (the detected mode with the highest PSD amplitude),
+while still optimizing the strict allowlisted `n` and `t` parameters. The exact
+target frequency and strategy are recorded in the report. It does not skip
+capability preflight, held-out reference/candidate sweeps, exact status
+readback, QC, confidence, cross-axis regression, or rollback.
 
-`APPLY` is runtime-only. `STAGE` prepares accepted native input-shaper values;
-the operator must separately invoke Klipper's `SAVE_CONFIG`. Calibration never
-automatically changes heater, fan, motor-current, or persistent acceleration
-settings.
+`APPLY` is runtime-only. `STAGE` writes the accepted stock-Klipper shaper type,
+frequency, and damping to Klipper's pending config state; the operator must
+separately invoke `SAVE_CONFIG` to persist them. Neither command changes
+`[printer] max_accel`. Calibration never automatically applies, stages, saves,
+or changes heater, fan, motor-current, or persistent acceleration settings.
 
 With `VALIDATE=1`, each axis uses three fitting sweeps, three independent
 held-out sweeps using the shaper active at session start, and three sweeps using
@@ -200,15 +233,16 @@ ADV_SHAPER_CALIBRATE AXIS=ALL PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_
 ```
 
 This performs two training, two held-out reference, and two candidate sweeps.
-For a 5–135 Hz range, the six physical sweeps are approximately 6.5 minutes per
-axis at 2 Hz/s. That estimate excludes movement between probe points, sensor
-setup, host analysis, report rendering, and artifact I/O. The faster rate and
-two-repeat confidence interval trade spectral and statistical confidence for
-time; all QC, 95% attenuation CI, cross-axis regression, exact readback, and
-rollback gates remain fail-closed. `FAST_VALIDATION=1` accepts neither one nor
-three repeats, requires explicit `HZ_PER_SEC=2`, and never makes a rejected
-result eligible for apply or stage. The default experimental path remains at
-least three repeats.
+For a 5–135 Hz range, the six commanded sweeps are approximately 6.5 minutes of
+resonance motion per axis at 2 Hz/s. This is not a promise that the complete
+axis workflow finishes within 6.5 or 7 minutes: movement between probe points,
+sensor setup, status checks, host analysis, report rendering, and artifact I/O
+add elapsed time. The faster rate and two-repeat confidence interval trade
+spectral and statistical confidence for time; all QC, 95% attenuation CI,
+cross-axis regression, exact readback, and rollback gates remain fail-closed.
+`FAST_VALIDATION=1` accepts neither one nor three repeats, requires explicit
+`HZ_PER_SEC=2`, and never makes a rejected result eligible for apply or stage.
+The default experimental path remains at least three repeats.
 
 Observed operational note: live attempt `9a822d6fdc4b` completed all 18 sweeps,
 was rejected safely by validation, and reported restoration of the baseline.
@@ -226,19 +260,37 @@ held-out validation and never permit one repeat. Their full-confidence
 default requires `REPEATS>=3`; only the explicit fast protocol permits exactly
 two repeats.
 
-`PROFILE=experimental_mzv` and `PROFILE=adaptive_stock` additionally require the config opt-in shown above,
-`VALIDATE=1`, and either the full-confidence or explicit fast repeat protocol.
-Before any experimental sweep, the
-plugin probes the installed `shaper_defs` implementation. Legacy or
-vendor-modified builds without the exact parameterized parser abstain; there is
-no silent compatibility fallback. After every temporary `SET_INPUT_SHAPER`, Klipper status
-must read back the exact canonical axis, identifier, frequency, and damping
-before validation can continue.
+`PROFILE=experimental_mzv` and `PROFILE=adaptive_stock` additionally require
+the config opt-in shown above, `VALIDATE=1`, and either the full-confidence or
+explicit fast repeat protocol. Before any experimental sweep, the plugin probes
+the installed `shaper_defs` implementation and generic executor. Current stock
+Klipper builds that provide the required allowlisted APIs work without core
+patches. Older, incompatible, or vendor-modified builds abstain; there is no
+silent compatibility fallback. After every temporary `SET_INPUT_SHAPER`,
+Klipper status must read back the exact canonical axis, identifier, frequency,
+and damping before validation can continue.
 
 A candidate rejected by held-out validation is never available to `APPLY` or
 `STAGE`. After the original printer state has been restored successfully, its
 private report retains the validation metrics and, when `keep_raw_data` is
 enabled, the training, reference, and candidate captures for diagnosis.
+
+## Results and output files
+
+Reports are private local files under:
+
+```text
+~/printer_data/config/AdvancedShaper_results/<attempt-id>/
+```
+
+The directory is created when an accepted report or a validation-rejected
+diagnostic is written; installation alone does not create it. A run that fails
+during preflight, capture, early analysis, artifact writing, or rollback may
+correctly have no attempt directory. `ADV_SHAPER_STATUS` reports artifact paths
+after they exist. Each completed report includes `report.html`, JSON and
+manifest data, PNG/SVG graphs, candidate and validation CSV files when data is
+available, and `captures.npz` when `keep_raw_data: True`. See
+[calibration reports](docs/reports.md).
 
 ## Development
 

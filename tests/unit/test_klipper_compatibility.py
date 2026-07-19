@@ -127,6 +127,14 @@ def test_native_capture_records_actual_explicit_sweep_rate(monkeypatch):
 
         def find_best_shaper(self, *_args, **_kwargs):
             NativeHelper.fitting_damping = _kwargs.get("damping_ratio")
+            assert _kwargs["shapers"] == (
+                "zv",
+                "mzv",
+                "zvd",
+                "ei",
+                "2hump_ei",
+                "3hump_ei",
+            )
             candidate = type(
                 "Candidate",
                 (),
@@ -228,6 +236,7 @@ def test_native_capture_records_actual_explicit_sweep_rate(monkeypatch):
         accel_per_hz=150.0,
         hz_per_sec=2.0,
         design_damping_ratio=0.08,
+        native_shapers=("zv", "mzv", "zvd", "ei", "2hump_ei", "3hump_ei"),
     )
 
     recipe = result["metadata"]["test_recipe"]
@@ -271,12 +280,25 @@ def test_adapter_passes_active_axis_damping_into_native_fitting():
     adapter = KlipperPrinterAdapter.__new__(KlipperPrinterAdapter)
     adapter.printer = Printer()
     adapter.capture_provider = Provider()
+    adapter._capture_native_shapers = None
 
     result = adapter.capture("X", 2, validation=True, accel_per_hz=75.0, hz_per_sec=2.0)
 
     assert result["design_damping_ratio"] == 0.043
     assert result["axis"] == "X"
     assert result["repeat"] == 2
+    assert result["native_shapers"] is None
+
+    adapter.configure_capture_profile("adaptive_stock")
+    adaptive = adapter.capture("X", 3, validation=True)
+    assert adaptive["native_shapers"] == (
+        "zv",
+        "mzv",
+        "zvd",
+        "ei",
+        "2hump_ei",
+        "3hump_ei",
+    )
 
 
 def test_capture_result_combines_multiple_probe_points_without_timestamp_gap():

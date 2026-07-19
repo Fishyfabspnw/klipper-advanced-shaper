@@ -1,16 +1,22 @@
 # Calibration reports
 
-Each attempt is written to a private directory beneath `result_folder`. The
-default is:
+Accepted results and validation-rejected diagnostics are written to private
+directories beneath `result_folder`. The default is:
 
 ```text
 ~/printer_data/config/AdvancedShaper_results/<attempt-id>/
 ```
 
-On a typical Klipper Pi, `~` is the account running Klipper. Set
+On a typical Klipper Pi, `~` is the home directory of the account running
+Klipper. Set
 `result_folder` explicitly in `[advanced_input_shaper]` if a different location
 is preferred. `ADV_SHAPER_STATUS` reports the artifact paths for the current
 attempt.
+
+The results root is created on the first artifact write, not during
+installation. A preflight, capture, early-analysis, artifact-write, or rollback
+failure can therefore have an attempt ID/status but no attempt directory. This
+is expected fail-closed behavior, not evidence that reports were redirected.
 
 The attempt directory contains:
 
@@ -24,7 +30,8 @@ The attempt directory contains:
 - `validation.csv`: aggregate held-out attenuation and cross-axis gate metrics,
   when validation data exists.
 - `result.json` and `manifest.json`: exact versioned report and integrity hashes.
-- `captures.npz`: private lossless sample arrays when `keep_raw_data: True`.
+- `captures.npz`: private lossless sample arrays when `keep_raw_data: True` and
+  capture groups are available.
 
 Raw accelerometer samples are never exported to CSV by default. Rejected
 attempts are clearly labeled and are retained only for diagnosis; they cannot

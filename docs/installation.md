@@ -57,10 +57,26 @@ The installer:
 2. installs or upgrades this repository in Klipper's virtual environment;
 3. preserves a different existing `advanced_input_shaper.py` loader as
    `advanced_input_shaper.py.previous`; and
-4. installs the repository's small Klippy loader.
+4. installs the repository's small Klippy loader; and
+5. installs `advanced_shaper_macros.cfg` in the printer config directory,
+   preserving a different existing macro file as
+   `advanced_shaper_macros.cfg.previous`.
 
 It does not change `printer.cfg`, restart Klipper, flash an MCU, or modify
-Klipper's motion-planner source.
+Klipper's motion planner, `shaper_defs.py`, `input_shaper.py`,
+`shaper_calibrate.py`, C kinematics helper, or MCU firmware. The loader is a new
+Klippy extra; it does not replace a stock Klipper module.
+
+The default macro destination is
+`~/printer_data/config/advanced_shaper_macros.cfg`. For a nonstandard printer
+config directory, include `KLIPPER_CONFIG_DIR` with the other absolute paths:
+
+```sh
+KLIPPER_DIR=/opt/klipper \
+KLIPPER_VENV=/opt/klippy-env \
+KLIPPER_CONFIG_DIR=/opt/printer_data/config \
+./scripts/install.sh
+```
 
 ## Configure Klipper
 
@@ -75,13 +91,22 @@ Add the following to `printer.cfg`:
 # analysis_timeout: 600
 # worker_memory_mb: 1536
 # worker_cpu_seconds: 300
+# enable_experimental_generalized_mzv: False
+
+[include advanced_shaper_macros.cfg]
 ```
 
-Only the section header is required. The commented values show the defaults,
-except `minimum_max_accel_x` and `minimum_max_accel_y`, which default to `0`
-(disabled). Those two options are acceptance gates for a specific printer, not
-general safety limits. Do not copy the example values unless they are justified
-for your machine.
+Only the `[advanced_input_shaper]` section header is required for the low-level
+commands. The include enables the supplied Mainsail-friendly macro. The
+commented values show the defaults, except `minimum_max_accel_x` and
+`minimum_max_accel_y`, which default to `0` (disabled). Those two options are
+acceptance gates for a specific printer, not general safety limits. Do not copy
+the example values unless they are justified for your machine.
+
+Leave `enable_experimental_generalized_mzv` false for `quality`, `balanced`, and
+`performance`. Set it to `True` only to opt into `experimental_mzv` or
+`adaptive_stock`; those profiles still perform an installed-Klipper capability
+probe and abstain before experimental motion on an unsupported build.
 
 With the printer idle, restart the actual Klipper service:
 
@@ -132,6 +157,32 @@ and make sure the printer is not printing. Begin with one axis:
 ADV_SHAPER_CALIBRATE AXIS=X PROFILE=balanced REPEATS=3 VALIDATE=1
 ```
 
+The visible `ADV_SHAPER_UI_CALIBRATE` macro accepts these same parameters:
+
+| Parameter | Values and behavior |
+| --- | --- |
+| `AXIS` | `X`, `Y`, or `ALL`; default `ALL`. |
+| `PROFILE` | `quality`, `balanced`, `performance`, `experimental_mzv`, or `adaptive_stock`; default `balanced`. The last two require the config opt-in and validation. |
+| `REPEATS` | Integer `1..20`; default `3`. Experimental profiles require at least three unless the exact fast protocol is selected. |
+| `VALIDATE` | `0` or `1`; default `1`. Mandatory for experimental profiles. |
+| `ACCEL_PER_HZ` | `CONFIG` or any unsigned decimal `20..150` mm/s^2/Hz. It is a free numeric value, not a preset list. |
+| `HZ_PER_SEC` | `CONFIG` or any unsigned decimal `0.1..2` Hz/s; default `CONFIG`. |
+| `FAST_VALIDATION` | `0` or `1`; default `0`. `1` is experimental-only and requires `REPEATS=2 VALIDATE=1 HZ_PER_SEC=2`. |
+| `PEAK_LOCK` | `0` or `1`; default `0`. Experimental-only; locks generalized MZV to the strongest measured axis peak. |
+
+Mainsail's standard macro UI cannot show a different tooltip for each input.
+The macro description and its start message summarize the controls; the table
+above is the complete reference. Enter `ACCEL_PER_HZ` directly in the macro
+parameters or console, for example:
+
+```text
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=balanced ACCEL_PER_HZ=75
+```
+
+Before motion, the resolved `ACCEL_PER_HZ` must fit the plugin's 80% dynamic
+motion budget. A value inside `20..150` can still be rejected for the current
+frequency range and printer `max_accel`.
+
 `VALIDATE=1` is the recommended fail-closed path. The plugin restores the
 original shaper and velocity state before making an accepted result available.
 Inspect the report and use the returned result ID explicitly:
@@ -142,9 +193,44 @@ ADV_SHAPER_STAGE RESULT=<result-id>
 SAVE_CONFIG
 ```
 
-`APPLY` changes only the current runtime. `STAGE` prepares native input-shaper
-values, and the separate `SAVE_CONFIG` is what persists them. Do not treat a
-reported smoothing-derived acceleration as a mechanically safe machine limit.
+`APPLY` changes only the current runtime. `STAGE` writes the accepted
+stock-Klipper shaper type, frequency, and damping to Klipper's pending config
+state, and the separate `SAVE_CONFIG` is what persists them. Calibration never
+automatically applies, stages, or saves a result. Neither path changes
+`[printer] max_accel`. Do not treat a reported smoothing-derived acceleration
+as a mechanically safe machine limit.
+
+For the stock-compatible adaptive search, enable the opt-in and use either the
+full-confidence protocol:
+
+```text
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=3 VALIDATE=1 ACCEL_PER_HZ=CONFIG
+```
+
+or the explicitly lower-confidence fast protocol:
+
+```text
+ADV_SHAPER_UI_CALIBRATE AXIS=X PROFILE=adaptive_stock REPEATS=2 VALIDATE=1 ACCEL_PER_HZ=150 HZ_PER_SEC=2 FAST_VALIDATION=1
+```
+
+For a configured 5–135 Hz range, fast validation commands six sweeps, or about
+6.5 minutes of resonance motion per axis at 2 Hz/s. Setup, probe movement,
+readback, analysis, rendering, and file I/O add time, so this is not a guarantee
+that the full workflow finishes within seven minutes.
+
+## Find the results
+
+The default output location is:
+
+```text
+~/printer_data/config/AdvancedShaper_results/<attempt-id>/
+```
+
+The plugin creates it only when it writes an accepted report or a
+validation-rejected diagnostic. Installation does not create the folder, and a
+preflight, capture, early-analysis, artifact-write, or rollback failure may
+leave no attempt directory. Run `ADV_SHAPER_STATUS` to see artifact paths once
+they exist. See [calibration reports](reports.md) for the file list.
 
 ## Update
 
@@ -157,7 +243,9 @@ sudo systemctl restart klipper
 ```
 
 The update script refuses a checkout with tracked local changes, performs a
-fast-forward-only pull, and reruns the installer. It never restarts Klipper.
+fast-forward-only pull, and reruns the installer. This reinstalls both the
+Python package and current loader/macro files. It never restarts Klipper or
+edits `printer.cfg`.
 
 If you deliberately maintain local changes, review and integrate upstream with
 Git yourself, then rerun `./scripts/install.sh`.
@@ -183,10 +271,11 @@ that the installed loader matches this checkout. If the installer preserved a
 pre-existing loader, the uninstaller restores it. It refuses to overwrite or
 remove a loader that has since changed.
 
-Remove `[advanced_input_shaper]` from `printer.cfg` before restarting. The
-uninstaller deliberately leaves the Git checkout and private result directory
-in place. Delete or archive those separately only after reviewing their
-contents.
+Remove `[advanced_input_shaper]` and `[include advanced_shaper_macros.cfg]` from
+`printer.cfg` before restarting. The uninstaller deliberately leaves the Git
+checkout, installed macro file, any `.previous` macro backup, and private result
+directory in place. Review, archive, restore, or delete those files manually as
+appropriate. The script never deletes printer configuration or results.
 
 ## Troubleshooting
 

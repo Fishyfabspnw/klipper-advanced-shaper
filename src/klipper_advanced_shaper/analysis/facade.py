@@ -8,7 +8,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from klipper_advanced_shaper import __version__
-from klipper_advanced_shaper.shapers import parse_shaper_identifier
+from klipper_advanced_shaper.shapers import NATIVE_SHAPER_ORDER, parse_shaper_identifier
 
 from .experimental import damping_samples, optimize_generalized_mzv
 from .models import CandidateScore, Spectrum
@@ -650,7 +650,7 @@ def analyze_calibration(
     if profile == "adaptive_stock":
         report["runtime_contract"] = {
             "interface": "stock_set_input_shaper",
-            "families": ["zv", "mzv", "zvd", "ei", "2hump_ei", "3hump_ei"],
+            "families": list(NATIVE_SHAPER_ORDER),
             "parameterized_family": "mzv",
             "arbitrary_pulse_vectors": False,
             "installed_capability_required": True,

@@ -15,10 +15,12 @@ result is not applied or persisted without a separate operator command.
 
 ## Non-goals
 
-The project does not change Klipper's motion planner, shaper impulse generation,
-kinematics, MCU firmware, or safety limits. It does not infer mechanically safe
-acceleration from smoothing alone. It does not automatically modify heaters,
-fans, motor currents, persistent velocity limits, or configuration files.
+The project adds one Klippy extra loader and an optional macro include, but does
+not modify Klipper's motion planner, `shaper_defs.py`, `input_shaper.py`,
+`shaper_calibrate.py`, shaper impulse generator, C kinematics helper, MCU
+firmware, or safety limits. It does not infer mechanically safe acceleration
+from smoothing alone. It does not automatically modify heaters, fans, motor
+currents, persistent velocity limits, or configuration files.
 
 ## Analysis contract
 
@@ -28,12 +30,13 @@ multiple modes, and uncertainty. Candidate selection returns either an
 allowlisted shaper and frequency or an explicit abstention with reasons.
 
 Native parity results and robust results remain distinguishable in artifacts.
-Normal profiles preserve the native ZV, MZV, EI, 2HUMP_EI, and 3HUMP_EI path.
-ZVD is exact-name allowlisted because current upstream defines it. The explicit
+Normal profiles preserve Klipper's ordinary autotune family set. ZVD is added
+only to the explicit six-family `adaptive_stock` comparison because current
+upstream defines it. The explicit
 `experimental_mzv` profile searches only canonical generalized MZV. The
-`adaptive_stock` profile compares all exact-name native candidates with those
-generalized-MZV candidates. Both require installed capability, validation,
-readback, and rollback gates.
+`adaptive_stock` profile compares exact-name ZV, MZV, ZVD, EI, 2HUMP_EI, and
+3HUMP_EI candidates with generalized-MZV candidates. Both experimental profiles
+require installed capability, validation, readback, and rollback gates.
 
 ## Klipper compatibility boundary
 
@@ -97,7 +100,8 @@ project-wide ten-pulse limit.
 
 ## Stock-compatible adaptive boundary
 
-The project does not emit arbitrary pulse arrays or private shaper names.
+The project does not emit arbitrary pulse arrays or private shaper names and
+does not install a custom executor.
 `adaptive_stock` ranks only exact native families plus strictly parsed
 generalized MZV. The installed `shaper_defs` implementation must reproduce the
 expected generalized pulse sequence and expose a compatible executor capacity

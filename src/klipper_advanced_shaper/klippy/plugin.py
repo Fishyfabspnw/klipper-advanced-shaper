@@ -224,6 +224,13 @@ class AdvancedInputShaper:
         excitation_preflight: Optional[Mapping[str, Any]] = None
         executor_pulse_limit = 10
         try:
+            capture_profile = getattr(self.adapter, "configure_capture_profile", None)
+            if profile == "adaptive_stock" and capture_profile is None:
+                raise RuntimeError(
+                    "adapter cannot request the complete stock shaper allowlist"
+                )
+            if capture_profile is not None:
+                capture_profile(profile)
             self.adapter.preflight(normalized_axes)
             excitation_probe = getattr(self.adapter, "preflight_excitation", None)
             if excitation_probe is None:

@@ -9,6 +9,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from klipper_advanced_shaper.shapers import NATIVE_SHAPER_ORDER
+
 from .excitation import check_motion_budget, check_sweep_rate
 
 _MAX_REPORT_FREQUENCY_BINS = 1024
@@ -266,6 +268,7 @@ class NativeResonanceCaptureProvider:
         accel_per_hz: Optional[float] = None,
         hz_per_sec: Optional[float] = None,
         design_damping_ratio: Optional[float] = None,
+        native_shapers: Optional[tuple[str, ...]] = None,
     ) -> dict[str, Any]:
         if design_damping_ratio is None or not np.isfinite(design_damping_ratio):
             raise RuntimeError("active input-shaper damping is required for native fitting")
@@ -298,14 +301,18 @@ class NativeResonanceCaptureProvider:
         eventtime = self.printer.get_reactor().monotonic()
         scv = self.printer.lookup_object("toolhead").get_status(eventtime)["square_corner_velocity"]
         max_frequency = tester._get_max_calibration_freq()
-        _best, candidates = native_helper.find_best_shaper(
-            data,
-            damping_ratio=float(design_damping_ratio),
-            max_smoothing=getattr(tester, "max_smoothing", None),
-            scv=scv,
-            max_freq=max_frequency,
-            logger=lambda _message: None,
-        )
+        fit_arguments = {
+            "damping_ratio": float(design_damping_ratio),
+            "max_smoothing": getattr(tester, "max_smoothing", None),
+            "scv": scv,
+            "max_freq": max_frequency,
+            "logger": lambda _message: None,
+        }
+        if native_shapers is not None:
+            if tuple(native_shapers) != NATIVE_SHAPER_ORDER:
+                raise RuntimeError("native shaper override is outside the stock allowlist")
+            fit_arguments["shapers"] = NATIVE_SHAPER_ORDER
+        _best, candidates = native_helper.find_best_shaper(data, **fit_arguments)
         result["axis"] = axis.upper()
         result["validation"] = bool(validation)
         result["native_candidates"] = [
